@@ -153,3 +153,35 @@ body {
   color: #1a1408;
   border-color: var(--accent);
 }
+/* ---------- Phase 2.5 diagnostics ---------- */
+.ai-state {
+  align-self: center;
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+.ai-state.ok { color: #9be3a7; border-color: rgba(127,208,140,.45); }
+.ai-state.loading { color: var(--accent); border-color: rgba(217,164,65,.45); }
+.ai-state.error { color: #f0a0a0; border-color: rgba(208,88,88,.5); }
+.debug-control { display: inline-flex; align-items: center; gap: 5px; }
+.debug-control:has(input:checked) { border-color: var(--accent); color: var(--accent); background: rgba(217,164,65,.08); }
+.metric {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-3);
+  font-size: 11px;
+  color: var(--muted);
+}
+.metric strong { color: var(--text); }
+@media (max-width: 1180px) {
+  .actions { gap: 5px; }
+  .actions .btn { padding: 8px 10px; font-size: 11px; }
+  .ai-state { display: none; }
+}
