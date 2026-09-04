@@ -1,75 +1,35 @@
 # La Cigogne D'Ailleurs — Creative Room Visualizer
 
-AI-assisted interior room visualizer: import a room photo, place catalog furniture, analyze the room with computer vision, and remove existing furniture with LaMa.
+## Phase 2.5 — Robust visual placement
 
-## Current Phase 1 + Phase 2
+This build keeps the Phase 1/2 editor and strengthens the room-analysis layer before Phase 3.
+
+### What was improved
+- Clean separation between editor and AI extension.
+- Floor mask cleanup with morphology and lower-boundary connected-component filtering.
+- Smoothed floor-boundary profile across the image.
+- Furniture movement is constrained to the room and anchored by the object's support point instead of snapping everything to the floor horizon.
+- Rotated furniture uses its true bottom-most transformed corner for floor contact.
+- Perspective scaling uses relative depth normalization plus a geometric fallback. Depth Anything V2 is a relative-depth model, not a metric camera measurement.
+- Existing furniture is rechecked against the floor mask after analysis.
+- Diagnostic overlays: floor mask, depth map, furniture zones, and floor boundary.
+- Keyboard diagnostics: F = floor, D = depth, Z = zones.
+- AI status messages distinguish server-offline errors from `/analyze` HTTP/model errors.
+- `/` backend route now gives a small service summary instead of `Not Found`.
+- `/health` reports CPU/CUDA and GPU information.
+
+## Run
 
 ### Frontend
-- Room image upload
-- Furniture catalog with real-world dimensions
-- Add / move / rotate / scale furniture
-- Duplicate / delete
-- PNG export
-- AI room analysis button
-- Floor segmentation overlay
-- Relative depth-based perspective scaling
-- Automatic floor anchoring after furniture movement
-- Optional furniture removal tool
-
-### AI backend
-- Depth Anything V2 Small for monocular depth
-- SegFormer ADE20K for semantic segmentation
-- Floor / wall / window / door / furniture masks
-- Scene metadata and furniture bounding boxes
-- LaMa inpainting for furniture removal
-- CUDA automatically used when available
-- Large input images are resized for inference to control VRAM usage
-
-## Project structure
-
-```text
-index.html
-css/
-  style.css
-js/
-  furniture-data.js   # catalog + generated SVG previews
-  app.js              # core editor and canvas interactions
-  ai.js               # Phase 2 AI integration
-  eraser.js           # furniture removal integration
-server/
-  main.py             # FastAPI AI service
-  requirements.txt
-```
-
-## Important script order
-
-The browser must load the catalog before the editor, and the editor before AI extensions:
-
-```html
-<script src="js/furniture-data.js"></script>
-<script src="js/app.js"></script>
-<script src="js/ai.js"></script>
-<script src="js/eraser.js"></script>
-```
-
-The previous version loaded `app.js` in the `<head>` before the DOM existed, loaded `eraser.js` before its dependencies, and loaded `app.js` twice. That structure has been removed.
-
-## Run the frontend
-
 From the project root:
 
 ```bash
 python -m http.server 5500
 ```
 
-Open:
+Open `http://localhost:5500`.
 
-```text
-http://localhost:5500
-```
-
-## Run the AI server
-
+### Backend
 In another terminal:
 
 ```bash
@@ -78,48 +38,26 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Check:
-
-```text
-http://localhost:8000/health
-```
-
-The first `/analyze` request downloads the pretrained models and may take a while.
+Check `http://localhost:8000/health`.
 
 ## Phase 2 pipeline
 
 ```text
 Room photo
-    ↓
+  ↓
 Resize for inference
-    ↓
-Depth Anything V2 ──────→ relative depth profile
-    ↓
-SegFormer ADE20K ───────→ floor / wall / window / door / furniture masks
-    ↓
-Scene metadata
-    ↓
-Perspective correction + floor anchoring
-    ↓
-2D furniture visualization
+  ├── Depth Anything V2 → relative depth profile
+  └── SegFormer ADE20K → floor / wall / furniture masks
+  ↓
+Floor-mask cleanup + floor boundary profile
+  ↓
+Perspective-aware 2D furniture sizing
+  ↓
+Floor support-point constraint
+  ↓
+Diagnostics + editor
 ```
 
-Furniture removal uses:
+## Phase 3
 
-```text
-Click furniture
-    ↓
-SegFormer mask selection
-    ↓
-Mask dilation / feathering
-    ↓
-LaMa inpainting
-    ↓
-Cleaned room image
-    ↓
-Run analysis again
-```
-
-## Next major phase
-
-The next architectural step is Phase 3: controlled 3D placement with Three.js / React Three Fiber and GLB/glTF furniture assets. The current Phase 2 depth is relative, not metric 3D reconstruction, so it should be treated as a placement aid rather than a calibrated physical camera model.
+Phase 3 remains controlled 3D placement with Three.js / React Three Fiber and GLB/glTF furniture assets. The current depth map is still relative depth, so this Phase 2.5 system is a robust 2D placement aid rather than calibrated metric 3D reconstruction.
