@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>La Cigogne D'Ailleurs — Creative Room Visualizer</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="stork">🕊</span>
+      <div>
+        <h1>La Cigogne D'Ailleurs</h1>
+        <p>Creative — Visualiseur de pièce</p>
+      </div>
+    </div>
+    <div class="actions">
+      <label class="btn">
+        📷 Importer une pièce
+        <input type="file" id="roomUpload" accept="image/jpeg,image/png,image/webp,image/*" hidden />
+      </label>
+      <button class="btn ghost" id="analyzeBtn" type="button">🔍 Analyser la pièce</button>
+      <label class="btn ghost" id="maskLabel" style="display:none">
+        <input type="checkbox" id="maskChk" hidden />
+        👁 Masque du sol
+      </label>
+      <button class="btn ghost" id="eraserBtn" type="button">🧹 Gomme : OFF</button>
+      <button class="btn ghost" id="exportBtn" type="button">⬇ Exporter PNG</button>
+      <button class="btn ghost danger" id="clearBtn" type="button">🗑 Tout effacer</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <h2>Catalogue</h2>
+      <div id="catalog"></div>
+      <p class="hint">Cliquez pour ajouter · Glissez pour déplacer</p>
+    </aside>
+
+    <main class="stage-wrap">
+      <canvas id="stage"></canvas>
+      <div class="empty-state" id="emptyState">
+        <p>Importez une photo de votre pièce pour commencer ✨</p>
+      </div>
+    </main>
+
+    <aside class="panel" id="inspector">
+      <h2>Objet sélectionné</h2>
+      <div id="inspectorBody">
+        <p class="hint">Sélectionnez un meuble sur le plan.</p>
+      </div>
+    </aside>
+  </div>
+
+  <footer class="statusbar">
+    <span id="status">Prêt</span>
+    <span class="tip">Double-clic : supprimer · molette : pivoter · analyse IA : profondeur + sol</span>
+  </footer>
+
+  <!-- Important: data first, then core app, then AI extensions. -->
+  <script src="js/furniture-data.js"></script>
+  <script src="js/app.js"></script>
+  <script src="js/ai.js"></script>
+  <script src="js/eraser.js"></script>
+</body>
+</html>
