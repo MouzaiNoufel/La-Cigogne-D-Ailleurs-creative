@@ -1,10 +1,11 @@
 fastapi
 uvicorn[standard]
 python-multipart
-transformers
-torch
-torchvision
-pillow
-numpy
+transformers>=5.0
+accelerate>=1.0
+safetensors>=0.7
+requests
+Pillow>=9.5
+numpy>=1.26
 simple-lama-inpainting
 opencv-python
