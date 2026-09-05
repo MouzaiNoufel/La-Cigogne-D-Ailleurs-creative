@@ -185,3 +185,38 @@ body {
   .actions .btn { padding: 8px 10px; font-size: 11px; }
   .ai-state { display: none; }
 }
+
+
+/* ---------- Phase 3 : Three.js overlay ---------- */
+#threeStage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+  z-index: 5;
+  cursor: grab;
+}
+#threeStage.active { display: block; }
+#threeStage:active { cursor: grabbing; }
+#occlusionStage {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: none;
+  z-index: 6;
+  pointer-events: none;
+}
+#occlusionStage.active { display: block; }
+.phase3-card {
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.phase3-title { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 10px; }
+.phase3-row { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; font-size: 11px; color: var(--muted); }
+.phase3-row strong { color: var(--text); font-weight: 600; text-align: right; }
+.gizmo-modes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin: 12px 0; }
+.gizmo-modes .btn { padding: 7px 4px; font-size: 10px; }
+.phase3-calibrate { width: 100%; margin-bottom: 3px; padding: 8px; font-size: 11px; }
