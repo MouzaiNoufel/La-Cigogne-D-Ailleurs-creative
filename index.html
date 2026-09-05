@@ -5,6 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>La Cigogne D'Ailleurs — Creative Room Visualizer</title>
   <link rel="stylesheet" href="css/style.css" />
+  <!-- Three.js import map: addons such as GLTFLoader import the core package as "three". -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.185.1/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.185.1/examples/jsm/"
+    }
+  }
+  </script>
 </head>
 <body>
   <header class="topbar">
@@ -19,6 +28,10 @@
       <label class="btn ghost debug-control" id="maskLabel"><input type="checkbox" id="maskChk" hidden />👁 Sol</label>
       <label class="btn ghost debug-control" id="depthLabel"><input type="checkbox" id="depthChk" hidden />◒ Profondeur</label>
       <label class="btn ghost debug-control" id="zonesLabel"><input type="checkbox" id="zonesChk" hidden />▣ Zones</label>
+      <button class="btn ghost" id="threeModeBtn" type="button">🧊 Mode 3D</button>
+      <button class="btn ghost" id="occlusionBtn" type="button" aria-pressed="false">◐ Occlusion IA : OFF</button>
+      <button class="btn ghost" id="glbBtn" type="button">📦 Importer GLB</button>
+      <input type="file" id="glbUpload" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" hidden />
       <button class="btn ghost" id="eraserBtn" type="button">🧹 Gomme : OFF</button>
       <button class="btn ghost" id="exportBtn" type="button">⬇ Exporter PNG</button>
       <button class="btn ghost danger" id="clearBtn" type="button">🗑 Tout effacer</button>
@@ -27,7 +40,7 @@
 
   <div class="layout">
     <aside class="sidebar"><h2>Catalogue</h2><div id="catalog"></div><p class="hint">Cliquez pour ajouter · Glissez pour déplacer</p></aside>
-    <main class="stage-wrap"><canvas id="stage"></canvas><div class="empty-state" id="emptyState"><p>Importez une photo de votre pièce pour commencer ✨</p></div></main>
+    <main class="stage-wrap"><canvas id="stage"></canvas><canvas id="threeStage" aria-label="Rendu 3D"></canvas><canvas id="occlusionStage" aria-label="Occlusion des meubles existants"></canvas><div class="empty-state" id="emptyState"><p>Importez une photo de votre pièce pour commencer ✨</p></div></main>
     <aside class="panel" id="inspector"><h2>Objet sélectionné</h2><div id="inspectorBody"><p class="hint">Sélectionnez un meuble sur le plan.</p></div></aside>
   </div>
 
@@ -37,5 +50,7 @@
   <script src="js/app.js"></script>
   <script src="js/ai.js"></script>
   <script src="js/eraser.js"></script>
+  <script type="module" src="js/phase3.js"></script>
+  <script src="js/phase4.js"></script>
 </body>
 </html>
