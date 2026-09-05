@@ -18,6 +18,8 @@ except ImportError:  # pragma: no cover
     cv2 = None
 
 MAX_ANALYSIS_SIDE = 1280
+MAX_UPLOAD_BYTES = 15 * 1024 * 1024
+Image.MAX_IMAGE_PIXELS = 30_000_000
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
 SEG_MODEL = "nvidia/segformer-b3-finetuned-ade-512-512"
 
@@ -31,7 +33,7 @@ ADE_FURNITURE = {
     "dining table", "pillow", "lamp", "television", "monitor", "plant",
 }
 
-app = FastAPI(title="La Cigogne D'Ailleurs AI", version="2.5.0")
+app = FastAPI(title="La Cigogne D'Ailleurs AI", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -81,8 +83,14 @@ def to_data_url(img: Image.Image, max_side: int | None = None) -> str:
 
 def read_image(file: UploadFile) -> Image.Image:
     try:
-        raw = file.file.read()
-        image = Image.open(io.BytesIO(raw)).convert("RGB")
+        if file.content_type and not file.content_type.startswith("image/"):
+            raise ValueError("content type must be an image")
+        raw = file.file.read(MAX_UPLOAD_BYTES + 1)
+        if not raw or len(raw) > MAX_UPLOAD_BYTES:
+            raise ValueError("image exceeds the 15 MB upload limit")
+        source = Image.open(io.BytesIO(raw))
+        source.load()
+        image = source.convert("RGB")
         if image.width < 64 or image.height < 64:
             raise ValueError("image too small")
         return image
@@ -123,6 +131,38 @@ def percentile_pair(values: np.ndarray, low_q=0.10, high_q=0.90):
     if hi <= lo + 1e-6:
         hi = lo + 1.0
     return float(lo), float(hi)
+
+
+def estimate_lighting(image: Image.Image) -> dict:
+    """Return conservative lighting hints for the browser renderer.
+
+    This is deliberately a color/luminance estimate, not a claim that a
+    single photograph recovers physically accurate light positions.
+    """
+    sample = image.convert("RGB")
+    sample.thumbnail((160, 160), Image.Resampling.BILINEAR)
+    rgb = np.asarray(sample, dtype=np.float32)
+    luminance = rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722
+    mean_rgb = rgb.reshape(-1, 3).mean(axis=0)
+    mean_luma = float(luminance.mean())
+    threshold = float(np.percentile(luminance, 82))
+    weights = np.clip(luminance - threshold, 0, None)
+    total = float(weights.sum())
+    h, w = luminance.shape
+    if total > 1e-3:
+        yy, xx = np.mgrid[0:h, 0:w]
+        cx = float((xx * weights).sum() / total) / max(1, w - 1)
+        cy = float((yy * weights).sum() / total) / max(1, h - 1)
+        key_rgb = (rgb * weights[..., None]).sum(axis=(0, 1)) / total
+    else:
+        cx, cy, key_rgb = .5, .3, mean_rgb
+    return {
+        "ambient_rgb": np.clip(mean_rgb, 0, 255).round().astype(int).tolist(),
+        "key_rgb": np.clip(key_rgb, 0, 255).round().astype(int).tolist(),
+        "ambient_intensity": round(float(np.clip(.75 + mean_luma / 255, .75, 1.75)), 2),
+        "key_intensity": round(float(np.clip(1.5 + mean_luma / 180, 1.5, 3.2)), 2),
+        "key_direction": {"x": round((cx - .5) * 2, 3), "z": round(.25 + (1 - cy) * .75, 3)},
+    }
 
 
 def clean_floor_mask(mask: np.ndarray) -> np.ndarray:
@@ -270,6 +310,7 @@ async def analyze(file: UploadFile = File(...)):
 
     floor_values = depth[floor_for_depth]
     depth_low, depth_high = percentile_pair(floor_values)
+    lighting = estimate_lighting(image)
     # Depth Anything V2 is relative depth. Infer its polarity from the
     # expected indoor perspective trend on the detected floor: pixels lower
     # in the image should normally represent the nearer part of the floor.
@@ -291,7 +332,7 @@ async def analyze(file: UploadFile = File(...)):
     top_profile_out = floor_top_profile[sample_x].round(1).tolist()
 
     return JSONResponse({
-        "version": 2.5,
+        "version": 4.0,
         "width": W, "height": H,
         "analysis_width": aw, "analysis_height": ah,
         "depth": to_data_url(depth_vis, max_side=1600),
@@ -304,6 +345,7 @@ async def analyze(file: UploadFile = File(...)):
         "floor_top_y": floor_top_y,
         "floor_top_profile": top_profile_out,
         "floor_source": floor_source,
+        "lighting": lighting,
         "scene": {
             "furniture_count": len(regions),
             "furniture": regions,
