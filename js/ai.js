@@ -87,10 +87,6 @@
     state.showFurnitureZones = zonesChk.checked;
     draw();
 
-    // Phase 4 consumers (occlusion and lighting) receive the same immutable
-    // analysis payload instead of running a second expensive model request.
-    window.dispatchEvent(new CustomEvent("room-analysis-ready", { detail: data }));
-
     // Reconcile existing furniture with the new floor mask. Do not move an
     // item unnecessarily if its support point is already valid.
     state.items.forEach(item => constrainToFloor(item, true));
