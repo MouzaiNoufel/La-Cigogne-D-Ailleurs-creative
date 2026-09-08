@@ -110,3 +110,26 @@ Important: Depth Anything V2 is relative depth, so this is an approximate occlus
 
 ### Next major step
 Phase 3D should move beyond approximate screen-space occlusion toward explicit room geometry: wall/floor planes, furniture/background masks, camera calibration from vanishing points, and eventually a reconstructed scene representation.
+
+
+## Phase 3D — Room reconstruction proxy + lighting match
+
+Phase 3D moves the compositor toward a reconstructed room representation without claiming a metric scan. It adds a lightweight four-surface room proxy (floor + three walls), photographic lighting estimation, and contact-shadow treatment while preserving the Phase 3C depth compositor.
+
+### Phase 3D features
+- Four-surface room proxy used as a shadow-receiving reconstruction scaffold.
+- Camera/depth calibration remains driven by the detected floor profile and relative depth.
+- Automatic light estimation from the room photograph: dominant bright-region direction, approximate color temperature, ambient level, and key-light intensity.
+- Manual temperature, exposure and key-light controls for correction.
+- Per-object contact shadow cards to improve floor contact at small scales.
+- AI depth occlusion remains active in the final screen-space compositor.
+
+Important limitation: the room proxy is an approximation. It is not a LiDAR scan, dense 3D reconstruction, or metrically guaranteed wall mesh. The next stage should use stronger geometric inference (vanishing points / planes / furniture masks) and eventually a learned or scanned scene representation.
+
+### Phase 3D stack
+- Three.js 0.185.1
+- GLTFLoader / OrbitControls / TransformControls / RoomEnvironment
+- PBR materials + ACES tone mapping
+- AI relative-depth compositor
+- Room proxy shadow surfaces
+- Image-based lighting estimation and manual calibration controls
