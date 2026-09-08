@@ -78,7 +78,7 @@
     const x = fit ? fit.x + fit.w * 0.5 : width * 0.5;
     const y = fit ? fit.y + fit.h * 0.72 : height * 0.5;
     const item = {
-      uid: nextUid(), catId, name: cat.name, w: cat.w, h: cat.h, d: cat.d,
+      uid: nextUid(), catId, name: cat.name, w: cat.w, d: cat.d,
       x, y, rot: 0, scale: 1, z: state.zCounter++,
     };
     state.items.push(item);
@@ -420,11 +420,7 @@
     if (state.roomObjectUrl) URL.revokeObjectURL(state.roomObjectUrl);
     state.roomObjectUrl = URL.createObjectURL(file); state.roomFileName = file.name; resetAnalysis();
     const img = new Image();
-    img.onload = () => {
-      state.roomImage = img; emptyState.style.display = "none";
-      window.dispatchEvent(new CustomEvent("room-image-changed"));
-      setStatus(`Pièce importée : ${file.name}`); draw();
-    };
+    img.onload = () => { state.roomImage = img; emptyState.style.display = "none"; setStatus(`Pièce importée : ${file.name}`); draw(); };
     img.onerror = () => setStatus("Impossible de lire cette image"); img.src = state.roomObjectUrl;
   });
 
@@ -477,25 +473,13 @@
   });
 
   document.getElementById("exportBtn").addEventListener("click", () => {
-    if (window.Phase3?.isEnabled?.()) {
-      window.Phase3.exportPNG();
-      return;
-    }
     const out = document.createElement("canvas");
     if (state.roomImage) { out.width = state.roomImage.naturalWidth; out.height = state.roomImage.naturalHeight; }
     else { const { width, height } = getCanvasSize(); out.width = Math.round(width); out.height = Math.round(height); }
     const octx = out.getContext("2d");
     if (state.roomImage) octx.drawImage(state.roomImage, 0, 0, out.width, out.height); else { octx.fillStyle = "#0e1117"; octx.fillRect(0, 0, out.width, out.height); }
-    const fit = roomFit();
-    if (state.roomImage && fit) {
-      // Convert the stage's letterboxed coordinates back to the source photo.
-      const factor = out.width / Math.max(1, fit.w);
-      octx.save(); octx.scale(factor, factor); octx.translate(-fit.x, -fit.y);
-      [...state.items].sort((a, b) => a.z - b.z).forEach(item => drawItem(item, octx));
-      octx.restore();
-    } else {
-      [...state.items].sort((a, b) => a.z - b.z).forEach(item => drawItem(item, octx));
-    }
+    const { width: cw } = getCanvasSize(); const factor = state.roomImage ? out.width / Math.max(1, cw) : 1;
+    octx.save(); octx.scale(factor, factor); [...state.items].sort((a, b) => a.z - b.z).forEach(item => drawItem(item, octx)); octx.restore();
     const a = document.createElement("a"); a.download = "cigogne-design.png"; a.href = out.toDataURL("image/png"); a.click(); setStatus("Image exportée ✔");
   });
 
