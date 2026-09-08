@@ -220,3 +220,10 @@ body {
 .phase3-actions .btn { padding:8px 4px; font-size:10px; }
 .phase3-title { letter-spacing:.45px; }
 #threeStage { image-rendering:auto; }
+
+
+/* ---------- Phase 3C : depth compositor ---------- */
+.phase3c-card { margin-top: 14px; }
+.phase3c-card .phase3-title { letter-spacing: .35px; }
+.phase3c-card .phase3-row strong { font-variant-numeric: tabular-nums; }
+#threeStage { mix-blend-mode: normal; }
