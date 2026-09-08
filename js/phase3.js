@@ -1,12 +1,16 @@
 /* =========================================================
-   Phase 3C — Depth-aware room compositing
+   Phase 3D — Room reconstruction proxy + lighting match
    Adds:
    - AI depth texture compositing against the 3D depth buffer
    - floor-calibrated depth -> approximate metric mapping
    - adjustable occlusion threshold / strength
    - foreground furniture can hide newly placed 3D objects
    - transform edits persist back to the 2D editor
-   - keeps Phase 3B PBR/photo-match workflow intact
+   - keeps Phase 3C PBR/photo-match workflow intact
+   - room proxy planes from floor/depth calibration
+   - automatic photographic lighting estimation
+   - color-temperature / exposure matching
+   - per-object contact shadow cards
    ========================================================= */
 
 import * as THREE from 'three';
@@ -54,6 +58,10 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     roomDepthNearIsHigh: true,
     depthFit: { a: 10, b: 0.6, ready: false },
     occlusion: { enabled: true, strength: 0.82, threshold: 0.18 },
+    lighting: { auto: true, temperature: 0.50, exposure: 1.05, key: 2.8, ambient: 1.35, fill: 0.65, estimated: false },
+    roomProxy: { enabled: true, wallDepth: 7.5, width: 12, height: 5.0 },
+    keyLight: null, ambientLight: null, fillLight: null,
+    proxyGroup: null, contactTexture: null,
     target: null,
     postScene: null,
     postCamera: null,
@@ -119,7 +127,7 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const after=new THREE.Box3().setFromObject(root),center=new THREE.Vector3();after.getCenter(center);root.position.sub(center);const floorBox=new THREE.Box3().setFromObject(root);root.position.y-=floorBox.min.y;
   }
   function createGroup(item){
-    const g=new THREE.Group();g.userData.uid=item.uid;g.userData.item=item;const asset=state.assets.get(item.catId);const model=asset?cloneAsset(asset):procedural(item.catId,item);if(asset)normalizeAsset(model,item);g.add(model);g.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true;}});state.scene.add(g);state.groups.set(item.uid,g);return g;
+    const g=new THREE.Group();g.userData.uid=item.uid;g.userData.item=item;const asset=state.assets.get(item.catId);const model=asset?cloneAsset(asset):procedural(item.catId,item);if(asset)normalizeAsset(model,item);g.add(model);g.traverse(o=>{if(o.isMesh){o.castShadow=true;o.receiveShadow=true;}});addContactCard(g,item);state.scene.add(g);state.groups.set(item.uid,g);return g;
   }
   function disposeObject(obj){obj.traverse(o=>{if(o.geometry)o.geometry.dispose();if(o.material){const ms=Array.isArray(o.material)?o.material:[o.material];ms.forEach(m=>m.dispose());}});state.scene.remove(obj);}
   function rect(){return canvas.getBoundingClientRect();}
@@ -132,7 +140,9 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const fit=App.roomFit();if(!fit||!App.state.roomImage)return;const sp=support(item),r=rect(),cs=App.getCanvasSize(),sx=r.width/cs.width,sy=r.height/cs.height,p=screenToFloor(r.left+sp.x*sx,r.top+sp.y*sy);if(p)g.position.set(p.x,0,p.z);g.rotation.y=-item.rot;g.scale.setScalar(Math.max(.55,item.scale*App.getPerspectiveFactor(item)));
   }
   function syncAll(){
-    if(!state.enabled)return;const live=new Set(App.state.items.map(i=>i.uid));for(const[uid,g]of state.groups)if(!live.has(uid)){disposeObject(g);state.groups.delete(uid);}for(const item of App.state.items){const g=state.groups.get(item.uid)||createGroup(item);if(!g.userData.edited3D)positionFrom2D(item,g);g.visible=true;}refreshSelection();updateDepthCalibration();
+    if(!state.enabled)return;
+    if(state.lighting.auto && !state.lighting.estimated) { estimateRoomLighting(); applyLighting(); }
+    updateRoomProxy();const live=new Set(App.state.items.map(i=>i.uid));for(const[uid,g]of state.groups)if(!live.has(uid)){disposeObject(g);state.groups.delete(uid);}for(const item of App.state.items){const g=state.groups.get(item.uid)||createGroup(item);if(!g.userData.edited3D)positionFrom2D(item,g);g.visible=true;}refreshSelection();updateDepthCalibration();
   }
   function resize(){const{w,h}=size(),dpr=Math.min(2,window.devicePixelRatio||1);state.renderer.setPixelRatio(dpr);state.renderer.setSize(w,h,false);state.camera.aspect=w/h;state.camera.updateProjectionMatrix();if(state.target)state.target.setSize(Math.round(w*dpr),Math.round(h*dpr));}
 
@@ -172,9 +182,85 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
   function refreshSelection(){
     const selected=App.getSelected();state.selectedUid=selected?.uid||null;for(const[uid,g]of state.groups){g.traverse(o=>{if(!o.isMesh||!o.material)return;const ms=Array.isArray(o.material)?o.material:[o.material];ms.forEach(m=>{if(!m.userData)m.userData={};if(!m.userData.p3Base)m.userData.p3Base=m.emissive?m.emissive.clone():new THREE.Color(0);if(m.emissive)m.emissive.copy(m.userData.p3Base).lerp(new THREE.Color('#d9a441'),uid===state.selectedUid?.12:0);});});}if(state.transform){const g=selected?state.groups.get(selected.uid):null;state.transform.detach();if(g&&state.enabled&&state.mode==='photo')state.transform.attach(g);}
   }
+  function luminance(r,g,b){ return (0.2126*r + 0.7152*g + 0.0722*b) / 255; }
+  function estimateRoomLighting(){
+    const img=App.state.roomImage;
+    if(!img || !state.lighting.auto) return;
+    const w=Math.min(360,img.naturalWidth||360), h=Math.max(1,Math.round((img.naturalHeight||240)*w/(img.naturalWidth||w)));
+    const c=document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d',{willReadFrequently:true});
+    ctx.drawImage(img,0,0,w,h); const data=ctx.getImageData(0,0,w,h).data;
+    let sum=0, wx=0, wy=0, red=0, blue=0, count=0;
+    const step=Math.max(3,Math.floor(Math.min(w,h)/70));
+    for(let y=0;y<h;y+=step){
+      for(let x=0;x<w;x+=step){
+        const i=(y*w+x)*4, r=data[i],g=data[i+1],b=data[i+2], lum=luminance(r,g,b);
+        const weight=Math.pow(Math.max(0,lum-.48),1.7);
+        sum+=lum; red+=r; blue+=b; count++;
+        if(weight>0){ wx+=x*weight; wy+=y*weight; }
+      }
+    }
+    if(!count)return;
+    const mean=sum/count, cx=wx/(Math.max(1,wx?sum*0+1:1));
+    // Recompute the bright centroid with a bounded denominator so a dark room
+    // still produces a stable neutral key direction.
+    let bright=0,bx=0,by=0;
+    for(let y=0;y<h;y+=step){ for(let x=0;x<w;x+=step){ const i=(y*w+x)*4; const lum=luminance(data[i],data[i+1],data[i+2]); const q=Math.pow(Math.max(0,lum-.50),1.9); bright+=q; bx+=x*q; by+=y*q; }}
+    const px=bright>1e-5?bx/bright:w*.5, py=bright>1e-5?by/bright:h*.35;
+    const nx=(px/(w-1))-.5, ny=(py/(h-1))-.5;
+    const rb=(red/Math.max(1,count))/(blue/Math.max(1,count));
+    // 0 = cool, 1 = warm. Clamp to avoid extreme casts from JPEG noise.
+    state.lighting.temperature=THREE.MathUtils.clamp(.5 + (rb-1)*.95,.15,.85);
+    state.lighting.ambient=THREE.MathUtils.clamp(.72 + mean*1.15,.72,1.65);
+    state.lighting.key=THREE.MathUtils.clamp(1.8 + mean*2.6,1.8,4.2);
+    state.lighting.fill=THREE.MathUtils.clamp(.35 + mean*.65,.35,1.0);
+    state.lighting.estimated=true;
+    state.lighting._brightX=nx; state.lighting._brightY=ny;
+  }
+  function kelvinColor(t){
+    // UI temperature is normalized 0..1. Map to 3000K..7000K.
+    const k=3000+t*4000, temp=k/100, r=k<=6600?255:329.698727*Math.pow(temp-60,-0.1332047592), g=k<=6600?99.470802586*Math.log(temp)-161.119568166:288.1221695283*Math.pow(temp-60,-0.0755148492), b=k>=6600?255:k<=1900?0:138.5177312231*Math.log(temp-10)-305.0447927307;
+    return new THREE.Color(Math.max(0,Math.min(255,r))/255,Math.max(0,Math.min(255,g))/255,Math.max(0,Math.min(255,b))/255);
+  }
+  function setupRoomProxy(){
+    state.proxyGroup=new THREE.Group(); state.proxyGroup.name='AI Room Proxy'; state.scene.add(state.proxyGroup);
+    const floorMat=new THREE.ShadowMaterial({opacity:.26});
+    const floor=new THREE.Mesh(new THREE.PlaneGeometry(state.roomProxy.width,18),floorMat); floor.rotation.x=-Math.PI/2; floor.position.y=.004; floor.receiveShadow=true; floor.name='floor-shadow-catcher'; state.proxyGroup.add(floor); state.floor=floor;
+    const wallMat=new THREE.ShadowMaterial({opacity:.12});
+    const wall=new THREE.Mesh(new THREE.PlaneGeometry(state.roomProxy.width,state.roomProxy.height),wallMat); wall.position.set(0,state.roomProxy.height*.5,-state.roomProxy.wallDepth); wall.receiveShadow=true; wall.name='back-wall-shadow-catcher'; state.proxyGroup.add(wall);
+    const left=new THREE.Mesh(new THREE.PlaneGeometry(18,state.roomProxy.height),wallMat.clone()); left.rotation.y=Math.PI/2; left.position.set(-state.roomProxy.width*.5,state.roomProxy.height*.5,-state.roomProxy.wallDepth*.35); left.receiveShadow=true; left.name='left-wall-shadow-catcher'; state.proxyGroup.add(left);
+    const right=new THREE.Mesh(new THREE.PlaneGeometry(18,state.roomProxy.height),wallMat.clone()); right.rotation.y=-Math.PI/2; right.position.set(state.roomProxy.width*.5,state.roomProxy.height*.5,-state.roomProxy.wallDepth*.35); right.receiveShadow=true; right.name='right-wall-shadow-catcher'; state.proxyGroup.add(right);
+  }
+  function updateRoomProxy(){
+    if(!state.proxyGroup)return;
+    state.proxyGroup.visible=state.roomProxy.enabled;
+    const children=state.proxyGroup.children;
+    const floor=children[0], wall=children[1], left=children[2], right=children[3];
+    floor.scale.x=state.roomProxy.width/12;
+    wall.position.z=-state.roomProxy.wallDepth; left.position.x=-state.roomProxy.width*.5; right.position.x=state.roomProxy.width*.5;
+    left.position.z=right.position.z=-state.roomProxy.wallDepth*.35;
+  }
+  function contactTexture(){
+    if(state.contactTexture)return state.contactTexture;
+    const c=document.createElement('canvas'); c.width=128;c.height=64;const x=c.getContext('2d');
+    const g=x.createRadialGradient(64,32,2,64,32,60);g.addColorStop(0,'rgba(0,0,0,.48)');g.addColorStop(.45,'rgba(0,0,0,.20)');g.addColorStop(1,'rgba(0,0,0,0)');x.fillStyle=g;x.fillRect(0,0,128,64);
+    state.contactTexture=new THREE.CanvasTexture(c);state.contactTexture.colorSpace=THREE.SRGBColorSpace;return state.contactTexture;
+  }
+  function addContactCard(g,item){
+    const m=new THREE.SpriteMaterial({map:contactTexture(),transparent:true,opacity:.46,depthWrite:false,depthTest:true});
+    const s=new THREE.Sprite(m);s.scale.set(Math.max(.18,item.w*.92),Math.max(.10,item.d*.42),1);s.position.set(0,.008,.03);s.renderOrder=-1;g.add(s);g.userData.contact=s;
+  }
+  function applyLighting(){
+    if(!state.keyLight)return;
+    const t=state.lighting.temperature, warm=kelvinColor(t), dir=state.lighting._brightX||-.18;
+    state.keyLight.color.copy(warm); state.keyLight.intensity=state.lighting.key; state.keyLight.position.set(THREE.MathUtils.clamp(dir*8,-6,6),6.5,4.5);
+    state.ambientLight.intensity=state.lighting.ambient; state.fillLight.intensity=state.lighting.fill; state.renderer.toneMappingExposure=state.lighting.exposure;
+  }
   function setupLighting(){
     const pmrem=new THREE.PMREMGenerator(state.renderer),env=new RoomEnvironment();state.environment=pmrem.fromScene(env,.04).texture;state.scene.environment=state.environment;env.dispose();pmrem.dispose();
-    state.scene.add(new THREE.HemisphereLight(0xffffff,0x6b6b6b,1.35));const key=new THREE.DirectionalLight(0xfff5e8,2.8);key.position.set(-3.5,6,4);key.castShadow=true;key.shadow.mapSize.set(2048,2048);key.shadow.camera.near=.1;key.shadow.camera.far=20;key.shadow.camera.left=-8;key.shadow.camera.right=8;key.shadow.camera.top=8;key.shadow.camera.bottom=-8;state.scene.add(key);const fill=new THREE.DirectionalLight(0xcfe1ff,.65);fill.position.set(4,3,-2);state.scene.add(fill);
+    state.ambientLight=new THREE.HemisphereLight(0xffffff,0x6b6b6b,1.35);state.scene.add(state.ambientLight);
+    state.keyLight=new THREE.DirectionalLight(0xfff5e8,2.8);state.keyLight.position.set(-3.5,6,4);state.keyLight.castShadow=true;state.keyLight.shadow.mapSize.set(2048,2048);state.keyLight.shadow.camera.near=.1;state.keyLight.shadow.camera.far=24;state.keyLight.shadow.camera.left=-8;state.keyLight.shadow.camera.right=8;state.keyLight.shadow.camera.top=8;state.keyLight.shadow.camera.bottom=-8;state.keyLight.shadow.bias=-.0005;state.scene.add(state.keyLight);
+    state.fillLight=new THREE.DirectionalLight(0xcfe1ff,.65);state.fillLight.position.set(4,3,-2);state.scene.add(state.fillLight);
+    estimateRoomLighting();applyLighting();
   }
   function makeShadowCatcher(){const geo=new THREE.PlaneGeometry(18,18),mat=new THREE.ShadowMaterial({opacity:.24});state.shadow=new THREE.Mesh(geo,mat);state.shadow.rotation.x=-Math.PI/2;state.shadow.position.y=.002;state.shadow.receiveShadow=true;state.shadow.renderOrder=-2;state.scene.add(state.shadow);}
 
@@ -210,28 +296,43 @@ import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
     const item=App.state.items.find(i=>i.uid===g?.userData?.uid);if(!item)return;const r=rect(),p=g.position.clone();p.y=.01;const projected=p.project(state.camera),px=r.left+(projected.x+1)*.5*r.width,py=r.top+(1-projected.y)*.5*r.height,fit=App.roomFit();if(!fit)return;const cs=App.getCanvasSize();item.x=fit.x+((px-r.left)/r.width)*cs.width;item.y=fit.y+((py-r.top)/r.height)*cs.height;item.rot=-g.rotation.y;const base=Math.max(.55,App.getPerspectiveFactor(item));item.scale=Math.max(.15,Math.min(4,g.scale.x/base));App.constrainToFloor(item,true);App.draw();g.userData.edited3D=false;status('Modification 3D enregistrée ✔');}
 
   function renderInspector3D(){
-    if(!state.enabled)return;const item=App.getSelected();const old=document.querySelector('.phase3-card');if(old)old.remove();inspectorBody.insertAdjacentHTML('beforeend',`<div class="phase3-card phase3c-card"><div class="phase3-title">🧠 DEPTH COMPOSITOR · 3D</div><div class="phase3-segment"><button id="p3Photo" class="btn ghost ${state.mode==='photo'?'active':''}">Photo Match</button><button id="p3Orbit" class="btn ghost ${state.mode==='orbit'?'active':''}">Vue 3D</button></div><div class="phase3-row"><span>Rendu</span><strong>Physically Based</strong></div><div class="phase3-row"><span>Occlusion</span><strong>${state.occlusion.enabled&&state.depthFit.ready?'AI depth · actif':'IA depth · calibration…'}</strong></div>${item?`<div class="phase3-row"><span>Objet</span><strong>${item.name}</strong></div>`:'<p class="hint">Sélectionnez un meuble.</p>'}<div class="field"><label>Hauteur caméra <span id="p3HVal">${state.calibration.height.toFixed(2)} m</span></label><input id="p3H" type="range" min="1.6" max="4.2" step="0.05" value="${state.calibration.height}"></div><div class="field"><label>FOV <span id="p3FVal">${state.calibration.fov}°</span></label><input id="p3F" type="range" min="35" max="70" step="1" value="${state.calibration.fov}"></div><label class="p3-check"><input id="p3Auto" type="checkbox" ${state.calibration.auto?'checked':''}> Calibration automatique depuis le sol</label><div class="phase3-row"><span>Profondeur</span><strong>${state.calibration.depth.toFixed(2)} m</strong></div><div class="phase3-row"><span>Occlusion IA</span><strong>${state.occlusion.enabled?'ON':'OFF'}</strong></div><div class="field"><label>Force occlusion <span id="p3OVal">${Math.round(state.occlusion.strength*100)}%</span></label><input id="p3O" type="range" min="0" max="1" step="0.05" value="${state.occlusion.strength}"></div><div class="field"><label>Tolérance profondeur <span id="p3TVal">${state.occlusion.threshold.toFixed(2)}</span></label><input id="p3T" type="range" min="0.04" max="0.45" step="0.01" value="${state.occlusion.threshold}"></div><label class="p3-check"><input id="p3Occl" type="checkbox" ${state.occlusion.enabled?'checked':''}> Occlusion par profondeur IA</label><div class="phase3-actions"><button id="p3Move" class="btn ghost">↔ Déplacer</button><button id="p3Rotate" class="btn ghost">↻ Tourner</button><button id="p3Scale" class="btn ghost">⤢ Échelle</button></div><p class="hint">Les objets placés derrière les surfaces estimées par l’IA peuvent maintenant être masqués pixel par pixel. La profondeur reste relative, donc la tolérance permet de corriger les zones ambiguës.</p></div>`);
-    const q=id=>document.getElementById(id);q('p3Photo').onclick=()=>setMode('photo');q('p3Orbit').onclick=()=>setMode('orbit');q('p3H').oninput=e=>{state.calibration.height=+e.target.value;q('p3HVal').textContent=`${state.calibration.height.toFixed(2)} m`;updateCamera();syncAll();};q('p3F').oninput=e=>{state.calibration.fov=+e.target.value;q('p3FVal').textContent=`${state.calibration.fov}°`;updateCamera();syncAll();};q('p3Auto').onchange=e=>{state.calibration.auto=e.target.checked;updateCamera();syncAll();};q('p3O').oninput=e=>{state.occlusion.strength=+e.target.value;q('p3OVal').textContent=`${Math.round(state.occlusion.strength*100)}%`;updatePostUniforms();};q('p3T').oninput=e=>{state.occlusion.threshold=+e.target.value;q('p3TVal').textContent=state.occlusion.threshold.toFixed(2);updatePostUniforms();};q('p3Occl').onchange=e=>{state.occlusion.enabled=e.target.checked;updatePostUniforms();renderInspector3D();};q('p3Move').onclick=()=>setTransform('translate');q('p3Rotate').onclick=()=>setTransform('rotate');q('p3Scale').onclick=()=>setTransform('scale');
+    if(!state.enabled)return;const item=App.getSelected();const old=document.querySelector('.phase3-card');if(old)old.remove();
+    inspectorBody.insertAdjacentHTML('beforeend',`<div class="phase3-card phase3d-card"><div class="phase3-title">✨ ROOM RECONSTRUCTION · 3D</div><div class="phase3-segment"><button id="p3Photo" class="btn ghost ${state.mode==='photo'?'active':''}">Photo Match</button><button id="p3Orbit" class="btn ghost ${state.mode==='orbit'?'active':''}">Vue 3D</button></div><div class="phase3-row"><span>Scene</span><strong>AI room proxy · 4 surfaces</strong></div><div class="phase3-row"><span>Occlusion</span><strong>${state.occlusion.enabled&&state.depthFit.ready?'AI depth · actif':'IA depth · calibration…'}</strong></div>${item?`<div class="phase3-row"><span>Objet</span><strong>${item.name}</strong></div>`:'<p class="hint">Sélectionnez un meuble.</p>'}<div class="phase3-divider"></div><div class="phase3-subtitle">📐 CAMÉRA</div><div class="field"><label>Hauteur caméra <span id="p3HVal">${state.calibration.height.toFixed(2)} m</span></label><input id="p3H" type="range" min="1.6" max="4.2" step="0.05" value="${state.calibration.height}"></div><div class="field"><label>FOV <span id="p3FVal">${state.calibration.fov}°</span></label><input id="p3F" type="range" min="35" max="70" step="1" value="${state.calibration.fov}"></div><label class="p3-check"><input id="p3Auto" type="checkbox" ${state.calibration.auto?'checked':''}> Calibration automatique depuis le sol</label><div class="phase3-row"><span>Profondeur proxy</span><strong>${state.calibration.depth.toFixed(2)} m</strong></div><div class="phase3-divider"></div><div class="phase3-subtitle">💡 LIGHT MATCH</div><div class="phase3-row"><span>Analyse photo</span><strong>${state.lighting.estimated?'détectée ✔':'manuelle'}</strong></div><label class="p3-check"><input id="p3LightAuto" type="checkbox" ${state.lighting.auto?'checked':''}> Lumière estimée depuis la photo</label><div class="field"><label>Température <span id="p3TempVal">${Math.round(3000+state.lighting.temperature*4000)} K</span></label><input id="p3Temp" type="range" min="0" max="1" step="0.02" value="${state.lighting.temperature}"></div><div class="field"><label>Exposition <span id="p3EVal">${state.lighting.exposure.toFixed(2)}</span></label><input id="p3E" type="range" min="0.70" max="1.45" step="0.01" value="${state.lighting.exposure}"></div><div class="field"><label>Lumière clé <span id="p3KVal">${state.lighting.key.toFixed(2)}</span></label><input id="p3K" type="range" min="0.8" max="4.5" step="0.1" value="${state.lighting.key}"></div><div class="phase3-divider"></div><div class="phase3-subtitle">🧱 ROOM PROXY</div><label class="p3-check"><input id="p3Proxy" type="checkbox" ${state.roomProxy.enabled?'checked':''}> Surfaces de pièce pour les ombres</label><div class="field"><label>Profondeur mur <span id="p3WVal">${state.roomProxy.wallDepth.toFixed(1)} m</span></label><input id="p3W" type="range" min="3" max="14" step="0.1" value="${state.roomProxy.wallDepth}"></div><div class="field"><label>Largeur pièce <span id="p3RWVal">${state.roomProxy.width.toFixed(1)} m</span></label><input id="p3RW" type="range" min="5" max="18" step="0.1" value="${state.roomProxy.width}"></div><div class="phase3-divider"></div><div class="phase3-subtitle">🧠 DEPTH COMPOSITOR</div><div class="field"><label>Force occlusion <span id="p3OVal">${Math.round(state.occlusion.strength*100)}%</span></label><input id="p3O" type="range" min="0" max="1" step="0.05" value="${state.occlusion.strength}"></div><div class="field"><label>Tolérance profondeur <span id="p3TVal">${state.occlusion.threshold.toFixed(2)}</span></label><input id="p3T" type="range" min="0.04" max="0.45" step="0.01" value="${state.occlusion.threshold}"></div><label class="p3-check"><input id="p3Occl" type="checkbox" ${state.occlusion.enabled?'checked':''}> Occlusion par profondeur IA</label><div class="phase3-actions"><button id="p3Move" class="btn ghost">↔ Déplacer</button><button id="p3Rotate" class="btn ghost">↻ Tourner</button><button id="p3Scale" class="btn ghost">⤢ Échelle</button></div><p class="hint">La pièce est représentée par un proxy géométrique calibré sur le sol et la profondeur IA. Le moteur estime aussi une direction, température et exposition de lumière depuis la photo. Ce n'est pas encore un scan 3D métrique.</p></div>`);
+    const q=id=>document.getElementById(id);
+    q('p3Photo').onclick=()=>setMode('photo');q('p3Orbit').onclick=()=>setMode('orbit');
+    q('p3H').oninput=e=>{state.calibration.height=+e.target.value;q('p3HVal').textContent=`${state.calibration.height.toFixed(2)} m`;updateCamera();syncAll();};
+    q('p3F').oninput=e=>{state.calibration.fov=+e.target.value;q('p3FVal').textContent=`${state.calibration.fov}°`;updateCamera();syncAll();};
+    q('p3Auto').onchange=e=>{state.calibration.auto=e.target.checked;updateCamera();syncAll();};
+    q('p3LightAuto').onchange=e=>{state.lighting.auto=e.target.checked;if(state.lighting.auto){estimateRoomLighting();applyLighting();}renderInspector3D();};
+    q('p3Temp').oninput=e=>{state.lighting.temperature=+e.target.value;state.lighting.auto=false;applyLighting();q('p3TempVal').textContent=`${Math.round(3000+state.lighting.temperature*4000)} K`;};
+    q('p3E').oninput=e=>{state.lighting.exposure=+e.target.value;applyLighting();q('p3EVal').textContent=state.lighting.exposure.toFixed(2);};
+    q('p3K').oninput=e=>{state.lighting.key=+e.target.value;state.lighting.auto=false;applyLighting();q('p3KVal').textContent=state.lighting.key.toFixed(2);};
+    q('p3Proxy').onchange=e=>{state.roomProxy.enabled=e.target.checked;updateRoomProxy();};
+    q('p3W').oninput=e=>{state.roomProxy.wallDepth=+e.target.value;q('p3WVal').textContent=`${state.roomProxy.wallDepth.toFixed(1)} m`;updateRoomProxy();};
+    q('p3RW').oninput=e=>{state.roomProxy.width=+e.target.value;q('p3RWVal').textContent=`${state.roomProxy.width.toFixed(1)} m`;updateRoomProxy();};
+    q('p3O').oninput=e=>{state.occlusion.strength=+e.target.value;q('p3OVal').textContent=`${Math.round(state.occlusion.strength*100)}%`;updatePostUniforms();};
+    q('p3T').oninput=e=>{state.occlusion.threshold=+e.target.value;q('p3TVal').textContent=state.occlusion.threshold.toFixed(2);updatePostUniforms();};
+    q('p3Occl').onchange=e=>{state.occlusion.enabled=e.target.checked;updatePostUniforms();renderInspector3D();};
+    q('p3Move').onclick=()=>setTransform('translate');q('p3Rotate').onclick=()=>setTransform('rotate');q('p3Scale').onclick=()=>setTransform('scale');
   }
   function setTransform(mode){if(!state.transform)return;state.transform.setMode(mode);state.transform.setSize(mode==='scale'?.68:.82);refreshSelection();status(`Gizmo 3D : ${mode==='translate'?'déplacement':mode==='rotate'?'rotation':'échelle'}`);}
   function setMode(mode){state.mode=mode;if(state.orbit)state.orbit.enabled=mode==='orbit';if(state.transform)state.transform.enabled=mode==='photo';if(mode==='photo'){updateCamera();syncAll();status('Photo Match actif — caméra verrouillée sur la perspective de la pièce');}else status('Vue 3D libre — inspection du modèle');renderInspector3D();refreshSelection();}
-  function setEnabled(enabled){if(enabled&&!App.state.roomImage){status('Importez d’abord une pièce pour utiliser la 3D');return;}state.enabled=enabled;canvas.classList.toggle('active',enabled);modeBtn.classList.toggle('active',enabled);modeBtn.textContent=enabled?'🧊 3D · DEPTH MATCH':'🧊 Mode 3D';if(enabled){updateCamera();if(App.state.depthImg&&!state.roomDepthTexture)loadRoomDepth();syncAll();setMode('photo');renderInspector3D();}else{state.transform?.detach();status('Mode 2D actif');}}
+  function setEnabled(enabled){if(enabled&&!App.state.roomImage){status('Importez d’abord une pièce pour utiliser la 3D');return;}state.enabled=enabled;canvas.classList.toggle('active',enabled);modeBtn.classList.toggle('active',enabled);modeBtn.textContent=enabled?'✨ 3D · ROOM MATCH':'🧊 Mode 3D';if(enabled){updateCamera();if(App.state.depthImg&&!state.roomDepthTexture)loadRoomDepth();syncAll();setMode('photo');renderInspector3D();}else{state.transform?.detach();status('Mode 2D actif');}}
 
   function init(){
     const{w,h}=size();state.camera=new THREE.PerspectiveCamera(state.calibration.fov,w/h,.05,100);state.camera.position.set(0,state.calibration.height,state.calibration.depth);
-    state.renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true,preserveDrawingBuffer:true,powerPreference:'high-performance'});state.renderer.outputColorSpace=THREE.SRGBColorSpace;state.renderer.toneMapping=THREE.ACESFilmicToneMapping;state.renderer.toneMappingExposure=1.05;state.renderer.shadowMap.enabled=true;state.renderer.shadowMap.type=THREE.PCFSoftShadowMap;setupLighting();makeShadowCatcher();
-    state.floor=new THREE.Mesh(new THREE.PlaneGeometry(30,30),new THREE.MeshBasicMaterial({transparent:true,opacity:0,depthWrite:false}));state.floor.rotation.x=-Math.PI/2;state.scene.add(state.floor);
+    state.renderer=new THREE.WebGLRenderer({canvas,alpha:true,antialias:true,preserveDrawingBuffer:true,powerPreference:'high-performance'});state.renderer.outputColorSpace=THREE.SRGBColorSpace;state.renderer.toneMapping=THREE.ACESFilmicToneMapping;state.renderer.toneMappingExposure=1.05;state.renderer.shadowMap.enabled=true;state.renderer.shadowMap.type=THREE.PCFSoftShadowMap;setupLighting();setupRoomProxy();
     state.orbit=new OrbitControls(state.camera,canvas);state.orbit.enableDamping=true;state.orbit.dampingFactor=.08;state.orbit.enabled=false;state.orbit.target.set(0,state.calibration.targetY,0);setupTransform();setupPostProcess();resize();window.addEventListener('resize',resize);requestAnimationFrame(loop);
   }
   function loop(){requestAnimationFrame(loop);if(!state.enabled){state.renderer.setRenderTarget(null);state.renderer.clear();return;}state.orbit.update();updatePostUniforms();state.renderer.setRenderTarget(state.target);state.renderer.clear(true,true,true);state.renderer.render(state.scene,state.camera);state.renderer.setRenderTarget(null);state.renderer.clear(true,true,true);state.renderer.render(state.postScene,state.postCamera);}
 
   modeBtn.addEventListener('click',()=>setEnabled(!state.enabled));
   glbBtn.addEventListener('click',()=>{if(!App.getSelected()){status('Sélectionnez d’abord un meuble, puis importez son GLB');return;}glbInput.click();});
-  glbInput.addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;const item=App.getSelected();if(!item)return;if(!/\.glb$/i.test(file.name)&&!/\.gltf$/i.test(file.name)){status('Format accepté : .glb ou .gltf');return;}status(`Chargement du modèle réaliste : ${file.name}…`);try{let gltf;if(/\.glb$/i.test(file.name))gltf=await state.loader.parseAsync(await file.arrayBuffer(),'');else{const url=URL.createObjectURL(file);try{gltf=await state.loader.loadAsync(url);}finally{URL.revokeObjectURL(url);}}state.assets.set(item.catId,gltf.scene);const old=state.groups.get(item.uid);if(old)disposeObject(old);const group=createGroup(item);positionFrom2D(item,group);if(!state.enabled)setEnabled(true);else refreshSelection();status(`${file.name} chargé ✔ — PBR + depth compositor`);}catch(err){console.error('[Phase3C] GLB error',err);status(`Échec du chargement 3D : ${err.message||err}`);}finally{glbInput.value='';}});
+  glbInput.addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;const item=App.getSelected();if(!item)return;if(!/\.glb$/i.test(file.name)&&!/\.gltf$/i.test(file.name)){status('Format accepté : .glb ou .gltf');return;}status(`Chargement du modèle réaliste : ${file.name}…`);try{let gltf;if(/\.glb$/i.test(file.name))gltf=await state.loader.parseAsync(await file.arrayBuffer(),'');else{const url=URL.createObjectURL(file);try{gltf=await state.loader.loadAsync(url);}finally{URL.revokeObjectURL(url);}}state.assets.set(item.catId,gltf.scene);const old=state.groups.get(item.uid);if(old)disposeObject(old);const group=createGroup(item);positionFrom2D(item,group);if(!state.enabled)setEnabled(true);else refreshSelection();status(`${file.name} chargé ✔ — PBR + room match`);}catch(err){console.error('[Phase3D] GLB error',err);status(`Échec du chargement 3D : ${err.message||err}`);}finally{glbInput.value='';}});
   canvas.addEventListener('pointerdown',e=>{if(!state.enabled||state.mode!=='photo'||state.transform?.dragging)return;const item=hit3D(e.clientX,e.clientY);if(item){AppActions.select(item.uid);refreshSelection();}});
   canvas.addEventListener('dblclick',e=>{if(!state.enabled)return;const item=hit3D(e.clientX,e.clientY);if(item)AppActions.select(item.uid);});
 
   window.Phase3={state,enable:()=>setEnabled(true),disable:()=>setEnabled(false),sync:()=>{if(App.state.depthImg&&!state.roomDepthTexture)loadRoomDepth();syncAll();},loadSelectedGLB:()=>glbInput.click(),setMode};
   const originalDraw=App.draw;App.draw=function patchedDraw(){originalDraw();if(state.enabled)syncAll();};
-  init();console.info('[Phase3C] Depth-aware 3D compositor initialized.');
+  init();console.info('[Phase3D] Room reconstruction proxy + lighting match initialized.');
 })();
