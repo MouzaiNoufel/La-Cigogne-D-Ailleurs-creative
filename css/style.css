@@ -235,10 +235,6 @@ body {
 .phase3d-card .phase3-row strong { font-variant-numeric: tabular-nums; }
 .phase3d-card .hint { font-size: 10.5px; }
 
-
-/* ---------- Phase 3E : photorealistic compositor ---------- */
-.phase3e-card { margin-top:14px; }
-.phase3e-card select { font-family:inherit; }
-.phase3e-card .phase3-title { letter-spacing:.45px; }
-.phase3e-card .hint { font-size:10.5px; }
-#p3ePreview { min-height:36px; }
+/* ---------- Phase 4 : AI scene editing ---------- */
+#undoAiBtn:disabled { opacity: .45; cursor: not-allowed; }
+#aiMaskOverlay { border-radius: 0; }
