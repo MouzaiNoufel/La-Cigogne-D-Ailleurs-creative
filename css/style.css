@@ -207,3 +207,16 @@ body {
 .phase3-title { font-size: 12px; font-weight: 700; color: var(--accent); margin-bottom: 10px; }
 .phase3-row { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; font-size: 11px; color: var(--muted); }
 .phase3-row strong { color: var(--text); font-weight: 600; text-align: right; }
+
+/* ---------- Phase 3B : modern photo-match workspace ---------- */
+#threeStage { z-index: 8; pointer-events: auto; }
+#threeStage.active { display:block; }
+.phase3b-card { margin-top: 14px; }
+.phase3-segment { display:grid; grid-template-columns:1fr 1fr; gap:6px; margin: 8px 0 12px; }
+.phase3-segment .btn { padding:8px 7px; font-size:11px; }
+.p3-check { display:flex; align-items:center; gap:8px; margin: 4px 0 12px; font-size:11px; color:var(--muted); }
+.p3-check input { accent-color:var(--accent); }
+.phase3-actions { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; margin-top:8px; }
+.phase3-actions .btn { padding:8px 4px; font-size:10px; }
+.phase3-title { letter-spacing:.45px; }
+#threeStage { image-rendering:auto; }
