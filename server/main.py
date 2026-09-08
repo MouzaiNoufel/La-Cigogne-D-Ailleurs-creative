@@ -31,7 +31,7 @@ ADE_FURNITURE = {
     "dining table", "pillow", "lamp", "television", "monitor", "plant",
 }
 
-app = FastAPI(title="La Cigogne D'Ailleurs AI", version="2.5.0")
+app = FastAPI(title="La Cigogne D'Ailleurs AI", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -291,7 +291,7 @@ async def analyze(file: UploadFile = File(...)):
     top_profile_out = floor_top_profile[sample_x].round(1).tolist()
 
     return JSONResponse({
-        "version": 2.5,
+        "version": 3.0,
         "width": W, "height": H,
         "analysis_width": aw, "analysis_height": ah,
         "depth": to_data_url(depth_vis, max_side=1600),
