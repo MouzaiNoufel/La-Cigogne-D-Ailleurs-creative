@@ -31,7 +31,7 @@ ADE_FURNITURE = {
     "dining table", "pillow", "lamp", "television", "monitor", "plant",
 }
 
-app = FastAPI(title="La Cigogne D'Ailleurs AI", version="3.0.0")
+app = FastAPI(title="La Cigogne D'Ailleurs AI", version="4.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -313,6 +313,73 @@ async def analyze(file: UploadFile = File(...)):
             "has_doors": "door" in masks,
         },
     })
+
+
+def furniture_mask_at(image: Image.Image, x: int, y: int):
+    W, H = image.size
+    x = int(np.clip(x, 0, W - 1)); y = int(np.clip(y, 0, H - 1))
+    _, sp = get_pipes()
+    analysis_image = resize_for_analysis(image)
+    aw, ah = analysis_image.size
+    sx = aw / W; sy = ah / H
+    ax = int(round(x * sx)); ay = int(round(y * sy))
+    seg_results = sp(analysis_image)
+    candidates = []
+    for result in seg_results:
+        label = str(result.get("label", "")).lower().strip()
+        if label not in ADE_FURNITURE:
+            continue
+        arr_small = mask_array(result["mask"], (aw, ah))
+        area = int(arr_small.sum())
+        if area < max(40, int(aw * ah * 0.0002)):
+            continue
+        y0, y1 = max(0, ay - 5), min(ah, ay + 6)
+        x0, x1 = max(0, ax - 5), min(aw, ax + 6)
+        if arr_small[y0:y1, x0:x1].any():
+            candidates.append((area, label, arr_small))
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Aucun meuble détecté à cet endroit — cliquez plus près du centre du meuble.")
+    _, selected_label, selected_small = min(candidates, key=lambda item: item[0])
+    mask_original = np.asarray(Image.fromarray((selected_small * 255).astype(np.uint8)).resize((W, H), Image.Resampling.NEAREST))
+    if cv2 is not None:
+        mask_u8 = (mask_original > 128).astype(np.uint8) * 255
+        dilated = cv2.dilate(mask_u8, np.ones((9, 9), np.uint8), iterations=2)
+        dilated = cv2.GaussianBlur(dilated, (5, 5), 0)
+        mask_original = dilated
+    return selected_label, Image.fromarray(mask_original).convert("L")
+
+
+@app.post("/select-mask")
+async def select_mask(file: UploadFile = File(...), x: int = Form(...), y: int = Form(...)):
+    image = read_image(file)
+    label, mask = furniture_mask_at(image, x, y)
+    arr = np.asarray(mask) > 80
+    ys, xs = np.where(arr)
+    bbox = None
+    if len(xs):
+        bbox = {"x": int(xs.min()), "y": int(ys.min()), "width": int(xs.max()-xs.min()+1), "height": int(ys.max()-ys.min()+1)}
+    return JSONResponse({"label": label, "mask": to_data_url(mask), "bbox": bbox})
+
+
+@app.post("/inpaint")
+async def inpaint(file: UploadFile = File(...), mask: UploadFile = File(...)):
+    image = read_image(file)
+    try:
+        raw_mask = mask.file.read()
+        mask_img = Image.open(io.BytesIO(raw_mask)).convert("L").resize(image.size, Image.Resampling.NEAREST)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Masque invalide: {exc}") from exc
+    mask_arr = np.asarray(mask_img)
+    if int((mask_arr > 80).sum()) < 20:
+        raise HTTPException(status_code=400, detail="Le masque est vide.")
+    if cv2 is not None:
+        u8 = (mask_arr > 80).astype(np.uint8) * 255
+        u8 = cv2.dilate(u8, np.ones((11, 11), np.uint8), iterations=1)
+        mask_img = Image.fromarray(cv2.GaussianBlur(u8, (5, 5), 0)).convert("L")
+    result = get_lama()(image, mask_img)
+    if not isinstance(result, Image.Image):
+        result = Image.fromarray(np.asarray(result).astype(np.uint8))
+    return JSONResponse({"image": to_data_url(result), "version": 4.0})
 
 
 @app.post("/remove")
