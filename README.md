@@ -58,11 +58,11 @@ Floor support-point constraint
 Diagnostics + editor
 ```
 
-## Phase 3B — 3D foundation
+## Phase 3C — 3D foundation
 
 This build adds a hybrid Three.js 3D layer over the existing room photo. Three.js loads GLB/glTF through `GLTFLoader`; the catalog also has procedural 3D fallbacks so the phase can be tested without downloading furniture assets. Three.js recommends glTF/GLB for runtime 3D delivery, and `GLTFLoader` supports glTF 2.0.
 
-### Phase 3B features
+### Phase 3C features
 - `Mode 3D` overlays real-time WebGL furniture on the room photo.
 - Existing Phase 2.5 furniture positions are projected onto a virtual floor plane.
 - Procedural 3D furniture is generated for every catalog item.
@@ -75,7 +75,7 @@ The camera is intentionally a calibration layer rather than claiming metric reco
 
 Three.js references: https://threejs.org/docs/pages/GLTFLoader.html and https://threejs.org/manual/en/loading-3d-models.html.
 
-### Next Phase 3B
+### Next Phase 3C
 - Per-object 3D transform gizmos.
 - Real floor-plane calibration from the detected floor profile.
 - GLB asset metadata and automatic dimension normalization.
@@ -84,10 +84,29 @@ Three.js references: https://threejs.org/docs/pages/GLTFLoader.html and https://
 - Optional React Three Fiber migration once the 3D interaction model is stable.
 
 
-## Phase 3B — Photo-matched 3D
+## Phase 3C — Photo-matched 3D
 
-Phase 3B upgrades the 3D layer from a basic overlay to a photo-matched compositor. It adds a locked perspective camera, automatic camera pitch/depth estimation from the Phase 2.5 floor profile, PBR/tone-mapped rendering, studio environment lighting, soft contact shadows, GLB dimension normalization, OrbitControls inspection mode, and TransformControls for precise 3D manipulation.
+Phase 3C upgrades the 3D layer from a basic overlay to a photo-matched compositor. It adds a locked perspective camera, automatic camera pitch/depth estimation from the Phase 2.5 floor profile, PBR/tone-mapped rendering, studio environment lighting, soft contact shadows, GLB dimension normalization, OrbitControls inspection mode, and TransformControls for precise 3D manipulation.
 
 The intended workflow is: analyze room → enter 3D Photo Match → select furniture → import GLB → adjust camera only when necessary → use the gizmo for precise placement.
 
 This is still not a full scanned-room reconstruction. Accurate per-pixel occlusion and full room geometry remain a later step.
+
+
+## Phase 3C — Depth-aware compositing
+
+Phase 3C keeps the Phase 3B PBR/photo-match workflow and adds a screen-space depth compositor. The AI depth map from Depth Anything V2 is fitted against the detected floor geometry, then compared with the Three.js depth buffer. This allows foreground room surfaces to hide parts of newly placed 3D furniture instead of treating the model as a flat overlay.
+
+Important: Depth Anything V2 is relative depth, so this is an approximate occlusion system rather than a metrically reconstructed room. The inspector exposes occlusion strength and depth tolerance for ambiguous regions. 2D state is also synchronized after TransformControls edits.
+
+### Phase 3C stack
+- Three.js 0.185.1
+- GLTFLoader / OrbitControls / TransformControls
+- PBR materials + ACES tone mapping + RoomEnvironment
+- AI depth texture compositing
+- floor-calibrated relative-depth fit
+- adjustable occlusion threshold
+- persistent 2D/3D transform synchronization
+
+### Next major step
+Phase 3D should move beyond approximate screen-space occlusion toward explicit room geometry: wall/floor planes, furniture/background masks, camera calibration from vanishing points, and eventually a reconstructed scene representation.
