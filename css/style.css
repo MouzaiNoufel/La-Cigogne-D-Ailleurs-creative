@@ -227,3 +227,10 @@ body {
 .phase3c-card .phase3-title { letter-spacing: .35px; }
 .phase3c-card .phase3-row strong { font-variant-numeric: tabular-nums; }
 #threeStage { mix-blend-mode: normal; }
+
+/* ---------- Phase 3D : room reconstruction + lighting match ---------- */
+.phase3d-card { margin-top: 14px; }
+.phase3-divider { height: 1px; background: var(--border); margin: 13px 0; }
+.phase3-subtitle { font-size: 10px; font-weight: 800; letter-spacing: .8px; color: var(--muted); margin-bottom: 9px; }
+.phase3d-card .phase3-row strong { font-variant-numeric: tabular-nums; }
+.phase3d-card .hint { font-size: 10.5px; }
