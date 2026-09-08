@@ -58,11 +58,11 @@ Floor support-point constraint
 Diagnostics + editor
 ```
 
-## Phase 3A — 3D foundation
+## Phase 3B — 3D foundation
 
 This build adds a hybrid Three.js 3D layer over the existing room photo. Three.js loads GLB/glTF through `GLTFLoader`; the catalog also has procedural 3D fallbacks so the phase can be tested without downloading furniture assets. Three.js recommends glTF/GLB for runtime 3D delivery, and `GLTFLoader` supports glTF 2.0.
 
-### Phase 3A features
+### Phase 3B features
 - `Mode 3D` overlays real-time WebGL furniture on the room photo.
 - Existing Phase 2.5 furniture positions are projected onto a virtual floor plane.
 - Procedural 3D furniture is generated for every catalog item.
@@ -82,3 +82,12 @@ Three.js references: https://threejs.org/docs/pages/GLTFLoader.html and https://
 - Occlusion-aware compositing.
 - Better photo/3D lighting matching.
 - Optional React Three Fiber migration once the 3D interaction model is stable.
+
+
+## Phase 3B — Photo-matched 3D
+
+Phase 3B upgrades the 3D layer from a basic overlay to a photo-matched compositor. It adds a locked perspective camera, automatic camera pitch/depth estimation from the Phase 2.5 floor profile, PBR/tone-mapped rendering, studio environment lighting, soft contact shadows, GLB dimension normalization, OrbitControls inspection mode, and TransformControls for precise 3D manipulation.
+
+The intended workflow is: analyze room → enter 3D Photo Match → select furniture → import GLB → adjust camera only when necessary → use the gizmo for precise placement.
+
+This is still not a full scanned-room reconstruction. Accurate per-pixel occlusion and full room geometry remain a later step.
