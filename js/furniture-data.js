@@ -88,17 +88,15 @@ const MAKERS = {
 };
 
 const CATALOG = [
-  // h is the real-world display height used to normalize imported GLB models.
-  // It deliberately lives with the catalog data rather than in the renderer.
-  { id: "sofa",      name: "Canapé 3 places", w: 2.20, h: 0.86, d: 0.95, color: "#7f9bb3", make: MAKERS.sofa },
-  { id: "armchair",  name: "Fauteuil",        w: 0.95, h: 0.88, d: 0.90, color: "#a98fbf", make: MAKERS.armchair },
-  { id: "bed",       name: "Lit 160×200",     w: 1.60, h: 0.62, d: 2.00, color: "#c2b8a3", make: MAKERS.bed },
-  { id: "table",     name: "Table basse",     w: 1.10, h: 0.48, d: 0.60, color: "#b08968", make: MAKERS.table },
-  { id: "chair",     name: "Chaise",          w: 0.45, h: 0.82, d: 0.45, color: "#8fa58f", make: MAKERS.chair },
-  { id: "lamp",      name: "Lampadaire",      w: 0.35, h: 1.58, d: 0.35, color: "#e0c36b", make: MAKERS.lamp },
-  { id: "plant",     name: "Plante",          w: 0.45, h: 0.85, d: 0.45, color: "#5d8a5d", make: MAKERS.plant },
-  { id: "rug",       name: "Tapis 160×110",   w: 1.60, h: 0.04, d: 1.10, color: "#c17f5e", make: MAKERS.rug },
-  { id: "tvstand",   name: "Meuble TV",       w: 1.80, h: 0.55, d: 0.40, color: "#9c8469", make: MAKERS.tvstand },
+  { id: "sofa",      name: "Canapé 3 places", w: 2.20, d: 0.95, color: "#7f9bb3", make: MAKERS.sofa },
+  { id: "armchair",  name: "Fauteuil",        w: 0.95, d: 0.90, color: "#a98fbf", make: MAKERS.armchair },
+  { id: "bed",       name: "Lit 160×200",     w: 1.60, d: 2.00, color: "#c2b8a3", make: MAKERS.bed },
+  { id: "table",     name: "Table basse",     w: 1.10, d: 0.60, color: "#b08968", make: MAKERS.table },
+  { id: "chair",     name: "Chaise",          w: 0.45, d: 0.45, color: "#8fa58f", make: MAKERS.chair },
+  { id: "lamp",      name: "Lampadaire",      w: 0.35, d: 0.35, color: "#e0c36b", make: MAKERS.lamp },
+  { id: "plant",     name: "Plante",          w: 0.45, d: 0.45, color: "#5d8a5d", make: MAKERS.plant },
+  { id: "rug",       name: "Tapis 160×110",   w: 1.60, d: 1.10, color: "#c17f5e", make: MAKERS.rug },
+  { id: "tvstand",   name: "Meuble TV",       w: 1.80, d: 0.40, color: "#9c8469", make: MAKERS.tvstand },
 ];
 
 // Pré-chargement des images
