@@ -133,3 +133,17 @@ Important limitation: the room proxy is an approximation. It is not a LiDAR scan
 - AI relative-depth compositor
 - Room proxy shadow surfaces
 - Image-based lighting estimation and manual calibration controls
+
+
+## Phase 3E — Photorealistic Compositor
+
+Phase 3E adds a non-destructive final photographic compositing pass on top of Phase 3D:
+- automatic room exposure/saturation/warmth estimation
+- foreground PBR grade harmonization
+- soft alpha edge integration
+- contact/floor integration pass
+- subtle film grain and vignette
+- native/2K/4K export options
+- preview and final render controls in the inspector
+
+Important: this is a deterministic compositing pipeline, not a diffusion/generative image model. It does not invent room pixels or claim generative photorealism.
