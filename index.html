@@ -29,7 +29,6 @@
       <label class="btn ghost debug-control" id="depthLabel"><input type="checkbox" id="depthChk" hidden />◒ Profondeur</label>
       <label class="btn ghost debug-control" id="zonesLabel"><input type="checkbox" id="zonesChk" hidden />▣ Zones</label>
       <button class="btn ghost" id="threeModeBtn" type="button">🧊 Mode 3D</button>
-      <button class="btn ghost" id="occlusionBtn" type="button" aria-pressed="false">◐ Occlusion IA : OFF</button>
       <button class="btn ghost" id="glbBtn" type="button">📦 Importer GLB</button>
       <input type="file" id="glbUpload" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" hidden />
       <button class="btn ghost" id="eraserBtn" type="button">🧹 Gomme : OFF</button>
@@ -40,7 +39,7 @@
 
   <div class="layout">
     <aside class="sidebar"><h2>Catalogue</h2><div id="catalog"></div><p class="hint">Cliquez pour ajouter · Glissez pour déplacer</p></aside>
-    <main class="stage-wrap"><canvas id="stage"></canvas><canvas id="threeStage" aria-label="Rendu 3D"></canvas><canvas id="occlusionStage" aria-label="Occlusion des meubles existants"></canvas><div class="empty-state" id="emptyState"><p>Importez une photo de votre pièce pour commencer ✨</p></div></main>
+    <main class="stage-wrap"><canvas id="stage"></canvas><canvas id="threeStage" aria-label="Rendu 3D"></canvas><div class="empty-state" id="emptyState"><p>Importez une photo de votre pièce pour commencer ✨</p></div></main>
     <aside class="panel" id="inspector"><h2>Objet sélectionné</h2><div id="inspectorBody"><p class="hint">Sélectionnez un meuble sur le plan.</p></div></aside>
   </div>
 
@@ -51,6 +50,5 @@
   <script src="js/ai.js"></script>
   <script src="js/eraser.js"></script>
   <script type="module" src="js/phase3.js"></script>
-  <script src="js/phase4.js"></script>
 </body>
 </html>
