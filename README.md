@@ -134,16 +134,37 @@ Important limitation: the room proxy is an approximation. It is not a LiDAR scan
 - Room proxy shadow surfaces
 - Image-based lighting estimation and manual calibration controls
 
+## Phase 4 — AI Scene Editing
 
-## Phase 3E — Photorealistic Compositor
+Phase 4 turns the existing point-based eraser into a deliberate replacement workflow. The user activates **Remplacer IA**, clicks a real furniture item, reviews the SegFormer-derived selection mask, then clicks again to remove it with LaMa inpainting. The edited room can immediately receive new catalog furniture from the existing editor.
 
-Phase 3E adds a non-destructive final photographic compositing pass on top of Phase 3D:
-- automatic room exposure/saturation/warmth estimation
-- foreground PBR grade harmonization
-- soft alpha edge integration
-- contact/floor integration pass
-- subtle film grain and vignette
-- native/2K/4K export options
-- preview and final render controls in the inspector
+### Phase 4 features
+- Smart point-to-furniture selection through the existing SegFormer model.
+- Visible selection mask before destructive editing.
+- LaMa inpainting through a dedicated `/inpaint` endpoint.
+- Up to 12 in-session AI edit history states.
+- `Annuler IA` button and `Ctrl/Cmd+Z` shortcut for AI edits.
+- Existing 2D editor, room analysis, depth, occlusion and 3D workflow are preserved.
 
-Important: this is a deterministic compositing pipeline, not a diffusion/generative image model. It does not invent room pixels or claim generative photorealism.
+### Workflow
+```text
+Room photo
+  ↓
+Remplacer IA
+  ↓
+Click existing furniture
+  ↓
+SegFormer → object mask
+  ↓
+Review highlighted mask
+  ↓
+Confirm
+  ↓
+LaMa inpainting
+  ↓
+Clean room
+  ↓
+Add catalog furniture / GLB
+```
+
+This phase uses LaMa inpainting rather than a generative diffusion model. It is intended for clean object removal and replacement preparation; photorealistic generative scene synthesis remains a later optional layer.
