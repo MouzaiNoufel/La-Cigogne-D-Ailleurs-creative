@@ -315,6 +315,83 @@ async def analyze(file: UploadFile = File(...)):
     })
 
 
+async def _segment_furniture_at_point(image: Image.Image, x: int, y: int):
+    """Return a clean full-resolution furniture mask and semantic label for a click."""
+    W, H = image.size
+    x = int(np.clip(x, 0, W - 1)); y = int(np.clip(y, 0, H - 1))
+    _, sp = get_pipes()
+    analysis_image = resize_for_analysis(image)
+    aw, ah = analysis_image.size
+    sx = aw / W; sy = ah / H
+    ax = int(round(x * sx)); ay = int(round(y * sy))
+
+    seg_results = sp(analysis_image)
+    candidates = []
+    for result in seg_results:
+        label = str(result.get("label", "")).lower().strip()
+        if label not in ADE_FURNITURE:
+            continue
+        arr_small = mask_array(result["mask"], (aw, ah))
+        area = int(arr_small.sum())
+        if area < max(40, int(aw * ah * 0.0002)):
+            continue
+        # A small click neighborhood is much more forgiving than a single pixel.
+        y0, y1 = max(0, ay - 8), min(ah, ay + 9)
+        x0, x1 = max(0, ax - 8), min(aw, ax + 9)
+        if arr_small[y0:y1, x0:x1].any():
+            candidates.append((area, label, arr_small))
+
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Aucun meuble détecté à cet endroit — cliquez au centre du meuble.")
+
+    # Prefer the smallest matching mask: a chair/pillow should not lose to a
+    # huge surrounding class when both contain the click.
+    _, selected_label, selected_small = min(candidates, key=lambda item: item[0])
+    mask_original = np.asarray(
+        Image.fromarray((selected_small * 255).astype(np.uint8)).resize((W, H), Image.Resampling.NEAREST)
+    )
+    if cv2 is not None:
+        mask_u8 = (mask_original > 128).astype(np.uint8) * 255
+        # Close tiny holes, then expand only slightly so LaMa gets a useful
+        # context ring without deleting large parts of neighboring furniture.
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8), iterations=1)
+        mask_u8 = cv2.dilate(mask_u8, np.ones((5, 5), np.uint8), iterations=1)
+        final_mask = Image.fromarray(mask_u8).convert("L")
+    else:
+        final_mask = Image.fromarray((mask_original > 128).astype(np.uint8) * 255).convert("L")
+    return image, selected_label, final_mask
+
+
+@app.post("/select-mask")
+async def select_mask(file: UploadFile = File(...), x: int = Form(...), y: int = Form(...)):
+    """Phase 4 smart-selection endpoint used by the frontend preview step."""
+    image = read_image(file)
+    _, label, mask = await _segment_furniture_at_point(image, x, y)
+    return JSONResponse({"mask": to_data_url(mask, max_side=1600), "label": label})
+
+
+@app.post("/inpaint")
+async def inpaint(file: UploadFile = File(...), mask: UploadFile = File(...)):
+    """Remove a user-confirmed furniture mask with LaMa."""
+    image = read_image(file)
+    try:
+        raw = await mask.read()
+        mask_img = Image.open(io.BytesIO(raw)).convert("L")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Masque invalide: {exc}") from exc
+    if mask_img.size != image.size:
+        mask_img = mask_img.resize(image.size, Image.Resampling.BILINEAR)
+    arr = np.asarray(mask_img, dtype=np.uint8)
+    if cv2 is not None:
+        # Make the transition softer and protect against a hard pasted seam.
+        arr = cv2.GaussianBlur(arr, (0, 0), 1.25)
+    mask_img = Image.fromarray(arr).convert("L")
+    result = get_lama()(image, mask_img)
+    if not isinstance(result, Image.Image):
+        result = Image.fromarray(np.asarray(result).astype(np.uint8))
+    return JSONResponse({"image": to_data_url(result), "label": "meuble"})
+
+
 @app.post("/remove")
 async def remove(file: UploadFile = File(...), x: int = Form(...), y: int = Form(...)):
     image = read_image(file)
