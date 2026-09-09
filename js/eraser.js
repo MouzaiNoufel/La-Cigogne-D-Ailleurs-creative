@@ -105,6 +105,8 @@
     eraserBtn.textContent="✨ Remplacer IA";
     eraserBtn.classList.remove("active");
     state.eraserOn=false;
+    const threeStage=document.getElementById("threeStage");
+    if(threeStage) threeStage.style.pointerEvents="auto";
   }
 
   eraserBtn.addEventListener("click", async () => {
@@ -132,6 +134,8 @@
     eraserBtn.textContent=state.eraserOn?"✨ Sélection IA : cliquez un meuble":"✨ Remplacer IA";
     eraserBtn.classList.toggle("active",state.eraserOn);
     canvas.style.cursor=state.eraserOn?"crosshair":"default";
+    const threeStage=document.getElementById("threeStage");
+    if(threeStage) threeStage.style.pointerEvents=state.eraserOn?"none":"auto";
     setStatus(state.eraserOn?"Sélection IA — cliquez le meuble réel à remplacer":"Édition IA désactivée");
   });
 
