@@ -1,161 +1,75 @@
-# La Cigogne D'Ailleurs — Creative Room Visualizer
+# La Cigogne D'Ailleurs — Phase 5.2 AI Remove 2.0
 
-## Phase 2.5 — Robust visual placement
+Professional Editor + **object-first AI removal and background reconstruction**.
 
-This build keeps the Phase 1/2 editor and strengthens the room-analysis layer before Phase 3.
+## What changed in 5.2
 
-### What was improved
-- Clean separation between editor and AI extension.
-- Floor mask cleanup with morphology and lower-boundary connected-component filtering.
-- Smoothed floor-boundary profile across the image.
-- Furniture movement is constrained to the room and anchored by the object's support point instead of snapping everything to the floor horizon.
-- Rotated furniture uses its true bottom-most transformed corner for floor contact.
-- Perspective scaling uses relative depth normalization plus a geometric fallback. Depth Anything V2 is a relative-depth model, not a metric camera measurement.
-- Existing furniture is rechecked against the floor mask after analysis.
-- Diagnostic overlays: floor mask, depth map, furniture zones, and floor boundary.
-- Keyboard diagnostics: F = floor, D = depth, Z = zones.
-- AI status messages distinguish server-offline errors from `/analyze` HTTP/model errors.
-- `/` backend route now gives a small service summary instead of `Not Found`.
-- `/health` reports CPU/CUDA and GPU information.
+### 1. Object-first selection
+- SegFormer is used only to identify the furniture class and create a local semantic prior.
+- The semantic mask is reduced to the connected component containing the user's click.
+- SAM (`facebook/sam-vit-base`) receives a tight semantic bounding box plus multiple interior positive points.
+- Candidate masks are validated by click coverage, semantic overlap, locality and area before being accepted.
+- GrabCut remains a local fallback if SAM cannot load or fails.
 
-## Run
+### 2. Correct mask preview
+- The frontend now treats the returned grayscale mask as **luminance**, not PNG alpha.
+- The old bug that visually made the entire room appear selected is removed.
+- The selected object is shown with a red transparent overlay and a contour before confirmation.
+- The action button explicitly says **Confirmer suppression**.
 
-### Frontend
-From the project root:
+### 3. Surface-constrained generative reconstruction
 
-```bash
-python -m http.server 5500
+Large furniture removal no longer sends the entire furniture hole to a generic “empty bedroom” diffusion prompt. The confirmed mask is first split by visible structural surface (wall vs floor/rug), and each surface is reconstructed independently with a surface-specific prompt and negative prompt. This prevents the inpainting model from treating the surrounding bedroom context as permission to invent another bed, table, or cabinet. Candidate selection also penalizes artificial edge energy, not only average boundary color. Generated pixels remain constrained to the confirmed mask with an inward-only feather.
+
+### 3. Safer inpainting
+- The confirmed object mask is kept tight; only a very small context ring is added.
+- The original pixels outside the confirmed mask are preserved during final compositing.
+- Small holes use local OpenCV texture reconstruction before LaMa refinement.
+- Floor/wall context is detected separately and is **never** allowed to become the object mask.
+- Large semantic regions are rejected instead of silently deleting a scene-sized area.
+
+### 4. Background reconstruction strategy
+
+```text
+click object
+    -> semantic class/context
+    -> clicked component
+    -> SAM silhouette
+    -> mask validation
+    -> red preview
+    -> surface context (floor / wall)
+    -> local texture reconstruction
+    -> LaMa semantic reconstruction
+    -> restore original pixels outside mask
 ```
 
-Open `http://localhost:5500`.
+This remains single-image reconstruction. If a large object completely hides background information, no algorithm can recover the exact unseen pixels; the goal is to produce a plausible, spatially consistent reconstruction without destroying neighboring surfaces.
 
-### Backend
-In another terminal:
+## Backend
 
-```bash
-cd server
-pip install -r requirements.txt
+Version: **4.1.0**
+
+Start with:
+
+```powershell
+cd "C:\Users\pc\Desktop\La Cigogne D'Ailleurs creative\server"
 uvicorn main:app --reload --port 8000
 ```
 
-Check `http://localhost:8000/health`.
+Frontend:
 
-## Phase 2 pipeline
-
-```text
-Room photo
-  ↓
-Resize for inference
-  ├── Depth Anything V2 → relative depth profile
-  └── SegFormer ADE20K → floor / wall / furniture masks
-  ↓
-Floor-mask cleanup + floor boundary profile
-  ↓
-Perspective-aware 2D furniture sizing
-  ↓
-Floor support-point constraint
-  ↓
-Diagnostics + editor
+```powershell
+cd "C:\Users\pc\Desktop\La Cigogne D'Ailleurs creative"
+python -m http.server 5500
 ```
 
-## Phase 3C — 3D foundation
 
-This build adds a hybrid Three.js 3D layer over the existing room photo. Three.js loads GLB/glTF through `GLTFLoader`; the catalog also has procedural 3D fallbacks so the phase can be tested without downloading furniture assets. Three.js recommends glTF/GLB for runtime 3D delivery, and `GLTFLoader` supports glTF 2.0.
+## Phase 5.2.4 — Generative Background Reconstruction
 
-### Phase 3C features
-- `Mode 3D` overlays real-time WebGL furniture on the room photo.
-- Existing Phase 2.5 furniture positions are projected onto a virtual floor plane.
-- Procedural 3D furniture is generated for every catalog item.
-- `Importer GLB` associates a `.glb`/`.gltf` model with the selected catalog type.
-- Camera calibration: height, FOV and scene depth.
-- 3D objects can be selected and moved directly in the 3D viewport.
-- 2D and 3D layers remain available; Phase 2.5 is preserved.
+Large furniture removal now uses an optional local diffusion inpainting model (`runwayml/stable-diffusion-inpainting`) on a padded crop around the selected object. The generated result is composited strictly inside the confirmed object mask. If the model cannot load, the deterministic surface-aware fallback remains available.
 
-The camera is intentionally a calibration layer rather than claiming metric reconstruction: Depth Anything V2 supplies relative depth, while the 3D camera still needs scene calibration.
-
-Three.js references: https://threejs.org/docs/pages/GLTFLoader.html and https://threejs.org/manual/en/loading-3d-models.html.
-
-### Next Phase 3C
-- Per-object 3D transform gizmos.
-- Real floor-plane calibration from the detected floor profile.
-- GLB asset metadata and automatic dimension normalization.
-- Occlusion-aware compositing.
-- Better photo/3D lighting matching.
-- Optional React Three Fiber migration once the 3D interaction model is stable.
+For an RTX 3070 Ti 8 GB, the backend uses CPU offload and attention slicing when CUDA is available. The first generative removal downloads the model weights from Hugging Face.
 
 
-## Phase 3C — Photo-matched 3D
-
-Phase 3C upgrades the 3D layer from a basic overlay to a photo-matched compositor. It adds a locked perspective camera, automatic camera pitch/depth estimation from the Phase 2.5 floor profile, PBR/tone-mapped rendering, studio environment lighting, soft contact shadows, GLB dimension normalization, OrbitControls inspection mode, and TransformControls for precise 3D manipulation.
-
-The intended workflow is: analyze room → enter 3D Photo Match → select furniture → import GLB → adjust camera only when necessary → use the gizmo for precise placement.
-
-This is still not a full scanned-room reconstruction. Accurate per-pixel occlusion and full room geometry remain a later step.
-
-
-## Phase 3C — Depth-aware compositing
-
-Phase 3C keeps the Phase 3B PBR/photo-match workflow and adds a screen-space depth compositor. The AI depth map from Depth Anything V2 is fitted against the detected floor geometry, then compared with the Three.js depth buffer. This allows foreground room surfaces to hide parts of newly placed 3D furniture instead of treating the model as a flat overlay.
-
-Important: Depth Anything V2 is relative depth, so this is an approximate occlusion system rather than a metrically reconstructed room. The inspector exposes occlusion strength and depth tolerance for ambiguous regions. 2D state is also synchronized after TransformControls edits.
-
-### Phase 3C stack
-- Three.js 0.185.1
-- GLTFLoader / OrbitControls / TransformControls
-- PBR materials + ACES tone mapping + RoomEnvironment
-- AI depth texture compositing
-- floor-calibrated relative-depth fit
-- adjustable occlusion threshold
-- persistent 2D/3D transform synchronization
-
-### Next major step
-Phase 3D should move beyond approximate screen-space occlusion toward explicit room geometry: wall/floor planes, furniture/background masks, camera calibration from vanishing points, and eventually a reconstructed scene representation.
-
-
-## Phase 3D — Room reconstruction proxy + lighting match
-
-Phase 3D moves the compositor toward a reconstructed room representation without claiming a metric scan. It adds a lightweight four-surface room proxy (floor + three walls), photographic lighting estimation, and contact-shadow treatment while preserving the Phase 3C depth compositor.
-
-### Phase 3D features
-- Four-surface room proxy used as a shadow-receiving reconstruction scaffold.
-- Camera/depth calibration remains driven by the detected floor profile and relative depth.
-- Automatic light estimation from the room photograph: dominant bright-region direction, approximate color temperature, ambient level, and key-light intensity.
-- Manual temperature, exposure and key-light controls for correction.
-- Per-object contact shadow cards to improve floor contact at small scales.
-- AI depth occlusion remains active in the final screen-space compositor.
-
-Important limitation: the room proxy is an approximation. It is not a LiDAR scan, dense 3D reconstruction, or metrically guaranteed wall mesh. The next stage should use stronger geometric inference (vanishing points / planes / furniture masks) and eventually a learned or scanned scene representation.
-
-### Phase 3D stack
-- Three.js 0.185.1
-- GLTFLoader / OrbitControls / TransformControls / RoomEnvironment
-- PBR materials + ACES tone mapping
-- AI relative-depth compositor
-- Room proxy shadow surfaces
-- Image-based lighting estimation and manual calibration controls
-
-
-## Phase 3E — Photorealistic Compositor
-
-Phase 3E adds a non-destructive final photographic compositing pass on top of Phase 3D:
-- automatic room exposure/saturation/warmth estimation
-- foreground PBR grade harmonization
-- soft alpha edge integration
-- contact/floor integration pass
-- subtle film grain and vignette
-- native/2K/4K export options
-- preview and final render controls in the inspector
-
-Important: this is a deterministic compositing pipeline, not a diffusion/generative image model. It does not invent room pixels or claim generative photorealism.
-
-
-## Phase 4 — AI Scene Editing
-
-Phase 4 adds smart furniture selection with SegFormer masks, LaMa inpainting, mask preview, and AI edit undo. The Phase 3E photorealistic compositing pipeline remains enabled.
-
-
-## Phase 5 — Professional Editor / Productization
-
-Phase 5 reorganizes the experience around direct manipulation rather than exposing the rendering engine as the primary UI. The room canvas is the main workspace, selected furniture gets a contextual toolbar, and the inspector focuses on size, rotation, position, duplicate and delete. Physical width/depth can be edited directly while preserving uniform scale. Camera, lighting, depth and reconstruction controls are moved behind an advanced section.
-
-Interaction improvements include smoother drag updates without rebuilding the inspector every pointer frame, larger selection affordances, contextual rotate/scale actions, keyboard-friendly controls, and a cleaner 3D inspector. The existing Phase 3A–3E rendering stack and Phase 4 AI editing workflow remain included.
+## Phase 5.2.4 — Generative reconstruction enforcement
+Large furniture removal now requires the diffusion inpainting backend instead of silently falling back to the old surface texture stretch. The backend logs the selected reconstruction method and tries two deterministic seeds, selecting the lower seam-discontinuity candidate. If diffusers/model loading is unavailable, `/inpaint` returns HTTP 503 with an actionable dependency message rather than producing a misleading low-quality result.
