@@ -48,6 +48,7 @@
     state.cssWidth = r.width;
     state.cssHeight = r.height;
     draw();
+    updateContextToolbar();
   }
 
   function getCanvasSize() {
@@ -260,9 +261,11 @@
     ctx.save();
     ctx.translate(item.x, item.y);
     ctx.rotate(item.rot);
-    ctx.strokeStyle = "rgba(217,164,65,.95)";
-    ctx.lineWidth = 2;
-    ctx.setLineDash([6, 5]);
+    ctx.fillStyle = "rgba(217,164,65,.055)";
+    ctx.fillRect(-w / 2, -h / 2, w, h);
+    ctx.strokeStyle = "rgba(255,255,255,.92)";
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
     ctx.strokeRect(-w / 2, -h / 2, w, h);
     ctx.setLineDash([]);
 
@@ -347,7 +350,6 @@
     if (state.roomImage) {
       const f = roomFit();
       ctx.drawImage(state.roomImage, f.x, f.y, f.w, f.h);
-      ctx.fillStyle = "rgba(10,12,18,0.12)"; ctx.fillRect(f.x, f.y, f.w, f.h);
       drawDebugOverlays();
     }
     [...state.items].sort((a, b) => a.z - b.z).forEach(item => drawItem(item));
@@ -386,69 +388,105 @@
     return null;
   }
 
+  function updateInspectorLive() {
+    const item = getSelected();
+    if (!item) return;
+    const rot = document.getElementById("rotVal");
+    const scale = document.getElementById("scaleVal");
+    const size = document.getElementById("sizeMetric");
+    const rotSlider = document.getElementById("rotSlider");
+    const scaleSlider = document.getElementById("scaleSlider");
+    const widthInput = document.getElementById("dimWidth");
+    const depthInput = document.getElementById("dimDepth");
+    const deg = Math.round((((item.rot * 180 / Math.PI) % 360) + 360) % 360);
+    const signedDeg = deg > 180 ? deg - 360 : deg;
+    if (rot) rot.textContent = `${signedDeg}°`;
+    if (scale) scale.textContent = `${Math.round(item.scale * 100)}%`;
+    if (size) size.textContent = `${(item.w * item.scale).toFixed(2)} × ${(item.d * item.scale).toFixed(2)} m`;
+    if (rotSlider) rotSlider.value = Math.max(-180, Math.min(180, signedDeg));
+    if (scaleSlider) scaleSlider.value = Math.round(item.scale * 100);
+    if (widthInput && document.activeElement !== widthInput) widthInput.value = (item.w * item.scale).toFixed(2);
+    if (depthInput && document.activeElement !== depthInput) depthInput.value = (item.d * item.scale).toFixed(2);
+    updateContextToolbar();
+  }
+
+  function updateContextToolbar() {
+    const bar = document.getElementById("contextToolbar");
+    const item = getSelected();
+    if (!bar || !item) { if (bar) bar.classList.remove("show"); return; }
+    const f = roomFit();
+    if (!f) return;
+    const x = Math.max(18, Math.min(state.cssWidth - 18, item.x));
+    const y = Math.max(48, item.y - itemSize(item).h / 2 - 56);
+    bar.style.left = `${x}px`;
+    bar.style.top = `${y}px`;
+    bar.classList.add("show");
+  }
+
   function renderInspector() {
     const item = getSelected();
     if (!item) {
-      inspectorBody.innerHTML = '<p class="hint">Sélectionnez un meuble sur le plan.</p>';
+      inspectorBody.innerHTML = '<div class="empty-inspector"><div class="empty-icon">✦</div><strong>Aucun meuble sélectionné</strong><span>Choisissez un meuble dans la scène ou ajoutez-en un depuis le catalogue.</span></div>';
+      updateContextToolbar();
       return;
     }
-    const deg = Math.round(item.rot * 180 / Math.PI);
+    const deg = Math.round((((item.rot * 180 / Math.PI) % 360) + 360) % 360);
+    const signedDeg = deg > 180 ? deg - 360 : deg;
     const persp = Math.round(getPerspectiveFactor(item) * 100);
     const realW = (item.w * item.scale).toFixed(2);
     const realD = (item.d * item.scale).toFixed(2);
     inspectorBody.innerHTML = `
-      <div class="obj-name">${item.name}</div>
-      <div class="obj-dims">Dimensions catalogue : ${item.w} m × ${item.d} m</div>
-      <div class="metric"><span>Perspective IA</span><strong>${persp}%</strong></div>
-      <div class="metric size-metric"><span>Taille actuelle</span><strong id="sizeMetric">${realW} × ${realD} m</strong></div>
-      <div class="field"><label>Rotation <span class="val" id="rotVal">${deg}°</span></label>
-        <input class="big-range" id="rotSlider" type="range" min="-180" max="180" value="${Math.max(-180, Math.min(180, deg))}" /></div>
-      <div class="field"><label>Échelle <span class="val" id="scaleVal">${Math.round(item.scale * 100)}%</span></label>
-        <input class="big-range" id="scaleSlider" type="range" min="30" max="300" value="${Math.round(item.scale * 100)}" /></div>
-      <div class="row quick-scale">
-        <button class="btn ghost" id="scaleDown" type="button">− 5%</button>
-        <button class="btn ghost" id="scaleReset" type="button">100%</button>
-        <button class="btn ghost" id="scaleUp" type="button">+ 5%</button>
+      <div class="selected-head">
+        <div class="selected-thumb">${(CATALOG.find(c=>c.id===item.catId)?.name||item.name).slice(0,1)}</div>
+        <div><div class="obj-name">${item.name}</div><div class="obj-dims">Dans votre pièce · ${persp}% perspective</div></div>
       </div>
-      <div class="field position-field">
-        <label>Position</label>
-        <div class="position-grid">
-          <button class="nudge" data-dx="-10" data-dy="0">←</button>
-          <button class="nudge" data-dx="0" data-dy="-10">↑</button>
-          <button class="nudge" data-dx="10" data-dy="0">→</button>
-          <button class="nudge" data-dx="0" data-dy="10">↓</button>
+      <div class="control-section">
+        <div class="section-label">Taille</div>
+        <div class="dimensions-grid">
+          <label><span>Largeur</span><input id="dimWidth" inputmode="decimal" type="number" min="0.10" max="10" step="0.01" value="${realW}"></label>
+          <div class="dimension-lock" title="Proportions conservées">🔒</div>
+          <label><span>Profondeur</span><input id="dimDepth" inputmode="decimal" type="number" min="0.10" max="10" step="0.01" value="${realD}"></label>
         </div>
+        <div class="size-row"><span id="sizeMetric">${realW} × ${realD} m</span><strong id="scaleVal">${Math.round(item.scale*100)}%</strong></div>
+        <input class="big-range" id="scaleSlider" type="range" min="30" max="300" value="${Math.round(item.scale*100)}" aria-label="Taille">
+        <div class="micro-actions"><button id="scaleDown" type="button">−</button><button id="scaleReset" type="button">100%</button><button id="scaleUp" type="button">+</button></div>
       </div>
-      <div class="row"><button class="btn ghost" id="dupBtn" type="button">⧉ Dupliquer</button>
-        <button class="btn ghost danger" id="delBtn" type="button">✕ Supprimer</button></div>
-      <p class="hint">Glisser le meuble = déplacer · 🟡 = pivoter · 🟢 = redimensionner. Shift = déplacement rapide.</p>`;
+      <div class="control-section">
+        <div class="section-label">Rotation</div>
+        <div class="rotation-readout"><span id="rotVal">${signedDeg}°</span><button id="rotReset" type="button">Réinitialiser</button></div>
+        <input class="big-range" id="rotSlider" type="range" min="-180" max="180" value="${signedDeg}" aria-label="Rotation">
+        <div class="rotation-quick"><button id="rotMinus" type="button">↶ 15°</button><button id="rotPlus" type="button">↷ 15°</button></div>
+      </div>
+      <div class="control-section position-section">
+        <div class="section-label">Position</div>
+        <div class="position-hint">Glissez directement le meuble dans la pièce.</div>
+        <div class="position-grid"><button class="nudge" data-dx="-6" data-dy="0">←</button><button class="nudge" data-dx="0" data-dy="-6">↑</button><button class="nudge" data-dx="0" data-dy="6">↓</button><button class="nudge" data-dx="6" data-dy="0">→</button></div>
+      </div>
+      <div class="action-row"><button class="secondary-action" id="dupBtn" type="button">⧉ Dupliquer</button><button class="danger-action" id="delBtn" type="button">Supprimer</button></div>
+      <details class="advanced-details"><summary>Réglages avancés</summary><div class="advanced-copy"><div>Perspective IA <b>${persp}%</b></div><div>Catalogue <b>${item.w.toFixed(2)} × ${item.d.toFixed(2)} m</b></div><div>Échelle interne <b>${Math.round(item.scale*100)}%</b></div></div></details>`;
 
-    const refreshSize = () => {
-      document.getElementById("sizeMetric").textContent = `${(item.w * item.scale).toFixed(2)} × ${(item.d * item.scale).toFixed(2)} m`;
-      document.getElementById("scaleVal").textContent = `${Math.round(item.scale * 100)}%`;
+    const refresh = () => { updateInspectorLive(); draw(); syncPhase3(); };
+    const setScale = value => { item.scale=Math.max(.3,Math.min(3,value)); refresh(); };
+    document.getElementById("scaleSlider").oninput=e=>setScale(Number(e.target.value)/100);
+    document.getElementById("scaleDown").onclick=()=>setScale(item.scale-.05);
+    document.getElementById("scaleUp").onclick=()=>setScale(item.scale+.05);
+    document.getElementById("scaleReset").onclick=()=>setScale(1);
+    const setDim = (which, value) => {
+      const v=Number(value); if(!Number.isFinite(v)||v<=0)return;
+      const base=which==='w'?item.w:item.d;
+      item.scale=Math.max(.3,Math.min(3,v/base));
+      refresh();
     };
-    document.getElementById("rotSlider").oninput = e => {
-      item.rot = Number(e.target.value) * Math.PI / 180;
-      document.getElementById("rotVal").textContent = `${e.target.value}°`;
-      draw(); syncPhase3();
-    };
-    document.getElementById("scaleSlider").oninput = e => {
-      item.scale = Number(e.target.value) / 100;
-      refreshSize(); draw(); syncPhase3();
-    };
-    const changeScale = delta => {
-      item.scale = Math.max(.3, Math.min(3, item.scale + delta));
-      document.getElementById("scaleSlider").value = Math.round(item.scale * 100);
-      refreshSize(); draw(); syncPhase3();
-    };
-    document.getElementById("scaleDown").onclick = () => changeScale(-.05);
-    document.getElementById("scaleUp").onclick = () => changeScale(.05);
-    document.getElementById("scaleReset").onclick = () => { item.scale=1; document.getElementById("scaleSlider").value=100; refreshSize(); draw(); syncPhase3(); };
-    inspectorBody.querySelectorAll('.nudge').forEach(btn => btn.onclick = () => {
-      item.x += Number(btn.dataset.dx); item.y += Number(btn.dataset.dy); clampToRoom(item); draw(); syncPhase3();
-    });
-    document.getElementById("dupBtn").onclick = () => duplicateItem(item.uid);
-    document.getElementById("delBtn").onclick = () => deleteItem(item.uid);
+    document.getElementById("dimWidth").onchange=e=>setDim('w',e.target.value);
+    document.getElementById("dimDepth").onchange=e=>setDim('d',e.target.value);
+    document.getElementById("rotSlider").oninput=e=>{item.rot=Number(e.target.value)*Math.PI/180;refresh();};
+    document.getElementById("rotMinus").onclick=()=>{item.rot-=Math.PI/12;refresh();};
+    document.getElementById("rotPlus").onclick=()=>{item.rot+=Math.PI/12;refresh();};
+    document.getElementById("rotReset").onclick=()=>{item.rot=0;refresh();};
+    inspectorBody.querySelectorAll('.nudge').forEach(btn=>btn.onclick=()=>{item.x+=Number(btn.dataset.dx);item.y+=Number(btn.dataset.dy);clampToRoom(item);refresh();});
+    document.getElementById("dupBtn").onclick=()=>duplicateItem(item.uid);
+    document.getElementById("delBtn").onclick=()=>deleteItem(item.uid);
+    updateContextToolbar();
   }
 
   function resetAnalysis() {
@@ -482,7 +520,7 @@
     const item = hitItem(p);
     if (item) {
       select(item.uid);
-      state.drag = { mode: "move", uid: item.uid, dx: p.x - item.x, dy: p.y - item.y, pointerId:e.pointerId };
+      state.drag = { mode: "move", uid: item.uid, dx: p.x - item.x, dy: p.y - item.y, startX:item.x, startY:item.y, pointerStartX:p.x, pointerStartY:p.y, pointerId:e.pointerId };
       canvas.setPointerCapture?.(e.pointerId); e.preventDefault(); return;
     }
     state.selectedId = null; renderInspector(); draw();
@@ -492,8 +530,8 @@
     if (!state.drag || state.eraserOn) return;
     const p = pointerPos(e); const item = state.items.find(i => i.uid === state.drag.uid); if (!item) return;
     if (state.drag.mode === "move") {
-      const speed = e.shiftKey ? 4 : 1;
-      item.x = p.x - state.drag.dx; item.y = p.y - state.drag.dy;
+      const speed = e.shiftKey ? 1.6 : 1;
+      item.x = state.drag.startX + (p.x - state.drag.pointerStartX) * speed; item.y = state.drag.startY + (p.y - state.drag.pointerStartY) * speed;
       // Keep movement fluid. Floor anchoring happens once at release instead
       // of fighting the pointer on every frame.
       clampToRoom(item);
@@ -502,11 +540,11 @@
       if (e.shiftKey) {
         const step=Math.PI/12; item.rot=Math.round(item.rot/step)*step;
       }
-      renderInspector();
+      updateInspectorLive();
     } else if (state.drag.mode === "scale") {
       const dist = Math.hypot(p.x - item.x, p.y - item.y);
       item.scale = Math.min(3, Math.max(0.3, item.scale * (dist / state.drag.dist0)));
-      state.drag.dist0 = Math.max(1, dist); renderInspector();
+      state.drag.dist0 = Math.max(1, dist); updateInspectorLive();
     }
     draw();
   });
@@ -562,6 +600,23 @@
     const btn = document.createElement("button"); btn.className = "catalog-item"; btn.type = "button";
     btn.innerHTML = `<img src="${svgUrl(item.make(item.color))}" alt="${item.name}" /><span class="meta"><span class="name">${item.name}</span><span class="dims">${item.w} × ${item.d} m</span></span>`;
     btn.onclick = () => addItem(item.id); catalogEl.appendChild(btn);
+  });
+
+  // Lightweight contextual toolbar: primary actions stay on the canvas.
+  const contextToolbar = document.createElement("div");
+  contextToolbar.id = "contextToolbar";
+  contextToolbar.innerHTML = '<button data-action="rotate-left" title="Tourner à gauche">↶</button><button data-action="rotate-right" title="Tourner à droite">↷</button><span class="toolbar-divider"></span><button data-action="smaller" title="Réduire">−</button><button data-action="bigger" title="Agrandir">+</button><span class="toolbar-divider"></span><button data-action="duplicate" title="Dupliquer">⧉</button><button data-action="delete" title="Supprimer">⌫</button>';
+  canvas.parentElement.appendChild(contextToolbar);
+  contextToolbar.addEventListener("pointerdown", e=>e.stopPropagation());
+  contextToolbar.addEventListener("click", e=>{
+    const action=e.target.closest("button")?.dataset.action, item=getSelected(); if(!action||!item)return;
+    if(action==='rotate-left')item.rot-=Math.PI/12;
+    if(action==='rotate-right')item.rot+=Math.PI/12;
+    if(action==='smaller')item.scale=Math.max(.3,item.scale-.05);
+    if(action==='bigger')item.scale=Math.min(3,item.scale+.05);
+    if(action==='duplicate')return duplicateItem(item.uid);
+    if(action==='delete')return deleteItem(item.uid);
+    renderInspector(); draw(); syncPhase3();
   });
 
   window.App = { PPM, state, canvas, ctx, setStatus, draw, roomFit, getCanvasSize, getSelected, hitItem, itemSize, resetAnalysis, getPerspectiveFactor, constrainToFloor, getSupportPoint, clampToRoom };
