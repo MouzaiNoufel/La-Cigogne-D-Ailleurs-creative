@@ -260,16 +260,27 @@
     ctx.save();
     ctx.translate(item.x, item.y);
     ctx.rotate(item.rot);
-    ctx.strokeStyle = "#d9a441";
-    ctx.lineWidth = 1.5;
-    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = "rgba(217,164,65,.95)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([6, 5]);
     ctx.strokeRect(-w / 2, -h / 2, w, h);
     ctx.setLineDash([]);
 
-    const ry = -h / 2 - 28;
+    // Rotation handle — large, visually separated from the box.
+    const ry = -h / 2 - 32;
     ctx.beginPath(); ctx.moveTo(0, -h / 2); ctx.lineTo(0, ry); ctx.stroke();
-    ctx.beginPath(); ctx.arc(0, ry, 8, 0, Math.PI * 2); ctx.fillStyle = "#d9a441"; ctx.fill();
-    ctx.beginPath(); ctx.arc(w / 2, h / 2, 8, 0, Math.PI * 2); ctx.fillStyle = "#7fd08c"; ctx.fill();
+    ctx.beginPath(); ctx.arc(0, ry, 11, 0, Math.PI * 2);
+    ctx.fillStyle = "#d9a441"; ctx.fill();
+    ctx.strokeStyle = "#fff4d0"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#1a1408"; ctx.font = "bold 11px Segoe UI"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("↻", 0, ry + 0.5);
+
+    // Scale handle — deliberately larger than the old 8px target.
+    const sx = w / 2, sy = h / 2;
+    ctx.beginPath(); ctx.arc(sx, sy, 12, 0, Math.PI * 2);
+    ctx.fillStyle = "#7fd08c"; ctx.fill();
+    ctx.strokeStyle = "#effff1"; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = "#123018"; ctx.font = "bold 11px Segoe UI"; ctx.fillText("↘", sx, sy + 0.5);
     ctx.restore();
   }
 
@@ -357,8 +368,11 @@
   function hitHandles(item, p) {
     const { w, h } = itemSize(item);
     const q = localPoint(item, p);
-    if (Math.hypot(q.x, q.y + h / 2 + 28) < 13) return "rotate";
-    if (Math.hypot(q.x - w / 2, q.y - h / 2) < 13) return "scale";
+    // Generous hit targets make manipulation usable on 1440p/4K screens.
+    const rotateRadius = Math.max(16, Math.min(24, Math.min(w, h) * 0.16));
+    const scaleRadius = Math.max(17, Math.min(24, Math.min(w, h) * 0.18));
+    if (Math.hypot(q.x, q.y + h / 2 + 32) < rotateRadius) return "rotate";
+    if (Math.hypot(q.x - w / 2, q.y - h / 2) < scaleRadius) return "scale";
     return null;
   }
 
@@ -380,28 +394,59 @@
     }
     const deg = Math.round(item.rot * 180 / Math.PI);
     const persp = Math.round(getPerspectiveFactor(item) * 100);
+    const realW = (item.w * item.scale).toFixed(2);
+    const realD = (item.d * item.scale).toFixed(2);
     inspectorBody.innerHTML = `
       <div class="obj-name">${item.name}</div>
-      <div class="obj-dims">${item.w} m × ${item.d} m</div>
+      <div class="obj-dims">Dimensions catalogue : ${item.w} m × ${item.d} m</div>
       <div class="metric"><span>Perspective IA</span><strong>${persp}%</strong></div>
-      <div class="field"><label>Rotation : <span class="val" id="rotVal">${deg}°</span></label>
-        <input type="range" id="rotSlider" min="-180" max="180" value="${Math.max(-180, Math.min(180, deg))}" /></div>
-      <div class="field"><label>Échelle : <span class="val" id="scaleVal">${Math.round(item.scale * 100)}%</span></label>
-        <input type="range" id="scaleSlider" min="30" max="300" value="${Math.round(item.scale * 100)}" /></div>
+      <div class="metric size-metric"><span>Taille actuelle</span><strong id="sizeMetric">${realW} × ${realD} m</strong></div>
+      <div class="field"><label>Rotation <span class="val" id="rotVal">${deg}°</span></label>
+        <input class="big-range" id="rotSlider" type="range" min="-180" max="180" value="${Math.max(-180, Math.min(180, deg))}" /></div>
+      <div class="field"><label>Échelle <span class="val" id="scaleVal">${Math.round(item.scale * 100)}%</span></label>
+        <input class="big-range" id="scaleSlider" type="range" min="30" max="300" value="${Math.round(item.scale * 100)}" /></div>
+      <div class="row quick-scale">
+        <button class="btn ghost" id="scaleDown" type="button">− 5%</button>
+        <button class="btn ghost" id="scaleReset" type="button">100%</button>
+        <button class="btn ghost" id="scaleUp" type="button">+ 5%</button>
+      </div>
+      <div class="field position-field">
+        <label>Position</label>
+        <div class="position-grid">
+          <button class="nudge" data-dx="-10" data-dy="0">←</button>
+          <button class="nudge" data-dx="0" data-dy="-10">↑</button>
+          <button class="nudge" data-dx="10" data-dy="0">→</button>
+          <button class="nudge" data-dx="0" data-dy="10">↓</button>
+        </div>
+      </div>
       <div class="row"><button class="btn ghost" id="dupBtn" type="button">⧉ Dupliquer</button>
         <button class="btn ghost danger" id="delBtn" type="button">✕ Supprimer</button></div>
-      <p class="hint">Jaune : pivoter · vert : redimensionner</p>`;
+      <p class="hint">Glisser le meuble = déplacer · 🟡 = pivoter · 🟢 = redimensionner. Shift = déplacement rapide.</p>`;
 
+    const refreshSize = () => {
+      document.getElementById("sizeMetric").textContent = `${(item.w * item.scale).toFixed(2)} × ${(item.d * item.scale).toFixed(2)} m`;
+      document.getElementById("scaleVal").textContent = `${Math.round(item.scale * 100)}%`;
+    };
     document.getElementById("rotSlider").oninput = e => {
       item.rot = Number(e.target.value) * Math.PI / 180;
       document.getElementById("rotVal").textContent = `${e.target.value}°`;
-      constrainToFloor(item, true); draw();
+      draw(); syncPhase3();
     };
     document.getElementById("scaleSlider").oninput = e => {
       item.scale = Number(e.target.value) / 100;
-      document.getElementById("scaleVal").textContent = `${e.target.value}%`;
-      constrainToFloor(item, true); draw();
+      refreshSize(); draw(); syncPhase3();
     };
+    const changeScale = delta => {
+      item.scale = Math.max(.3, Math.min(3, item.scale + delta));
+      document.getElementById("scaleSlider").value = Math.round(item.scale * 100);
+      refreshSize(); draw(); syncPhase3();
+    };
+    document.getElementById("scaleDown").onclick = () => changeScale(-.05);
+    document.getElementById("scaleUp").onclick = () => changeScale(.05);
+    document.getElementById("scaleReset").onclick = () => { item.scale=1; document.getElementById("scaleSlider").value=100; refreshSize(); draw(); syncPhase3(); };
+    inspectorBody.querySelectorAll('.nudge').forEach(btn => btn.onclick = () => {
+      item.x += Number(btn.dataset.dx); item.y += Number(btn.dataset.dy); clampToRoom(item); draw(); syncPhase3();
+    });
     document.getElementById("dupBtn").onclick = () => duplicateItem(item.uid);
     document.getElementById("delBtn").onclick = () => deleteItem(item.uid);
   }
@@ -424,47 +469,73 @@
     img.onerror = () => setStatus("Impossible de lire cette image"); img.src = state.roomObjectUrl;
   });
 
-  canvas.addEventListener("mousedown", e => {
+  canvas.addEventListener("pointerdown", e => {
     if (state.eraserOn) return;
     const p = pointerPos(e); const selected = getSelected();
     if (selected) {
       const handle = hitHandles(selected, p);
       if (handle) {
         state.drag = { mode: handle, uid: selected.uid, dist0: Math.max(1, Math.hypot(p.x - selected.x, p.y - selected.y)) };
-        canvas.setPointerCapture?.(e.pointerId); return;
+        canvas.setPointerCapture?.(e.pointerId); e.preventDefault(); return;
       }
     }
     const item = hitItem(p);
-    if (item) { select(item.uid); state.drag = { mode: "move", uid: item.uid, dx: p.x - item.x, dy: p.y - item.y }; return; }
+    if (item) {
+      select(item.uid);
+      state.drag = { mode: "move", uid: item.uid, dx: p.x - item.x, dy: p.y - item.y, pointerId:e.pointerId };
+      canvas.setPointerCapture?.(e.pointerId); e.preventDefault(); return;
+    }
     state.selectedId = null; renderInspector(); draw();
   });
 
-  canvas.addEventListener("mousemove", e => {
+  canvas.addEventListener("pointermove", e => {
     if (!state.drag || state.eraserOn) return;
     const p = pointerPos(e); const item = state.items.find(i => i.uid === state.drag.uid); if (!item) return;
     if (state.drag.mode === "move") {
-      item.x = p.x - state.drag.dx; item.y = p.y - state.drag.dy; clampToRoom(item);
+      const speed = e.shiftKey ? 4 : 1;
+      item.x = p.x - state.drag.dx; item.y = p.y - state.drag.dy;
+      // Keep movement fluid. Floor anchoring happens once at release instead
+      // of fighting the pointer on every frame.
+      clampToRoom(item);
     } else if (state.drag.mode === "rotate") {
-      item.rot = Math.atan2(p.y - item.y, p.x - item.x) + Math.PI / 2; constrainToFloor(item, true);
+      item.rot = Math.atan2(p.y - item.y, p.x - item.x) + Math.PI / 2;
+      if (e.shiftKey) {
+        const step=Math.PI/12; item.rot=Math.round(item.rot/step)*step;
+      }
+      renderInspector();
     } else if (state.drag.mode === "scale") {
       const dist = Math.hypot(p.x - item.x, p.y - item.y);
       item.scale = Math.min(3, Math.max(0.3, item.scale * (dist / state.drag.dist0)));
-      state.drag.dist0 = Math.max(1, dist); constrainToFloor(item, true);
+      state.drag.dist0 = Math.max(1, dist); renderInspector();
     }
-    draw(); if (state.drag.mode !== "move") renderInspector();
+    draw();
   });
 
-  window.addEventListener("mouseup", () => {
+  canvas.addEventListener("pointerup", e => {
     if (!state.drag) return;
-    const mode = state.drag.mode; const item = state.items.find(i => i.uid === state.drag.uid); state.drag = null;
-    if (mode === "move" && item) { constrainToFloor(item, false); renderInspector(); draw(); syncPhase3(); }
+    const mode = state.drag.mode;
+    const item = state.items.find(i => i.uid === state.drag.uid);
+    state.drag = null;
+    try { canvas.releasePointerCapture?.(e.pointerId); } catch {}
+    if (item) {
+      if (mode === "move") constrainToFloor(item, false);
+      renderInspector(); draw(); syncPhase3();
+    }
   });
+
+  canvas.addEventListener("pointercancel", () => { state.drag = null; });
 
   canvas.addEventListener("dblclick", e => { if (!state.eraserOn) { const item = hitItem(pointerPos(e)); if (item) deleteItem(item.uid); } });
   canvas.addEventListener("wheel", e => {
-    if (state.eraserOn) return; const item = hitItem(pointerPos(e)); if (!item) return; e.preventDefault();
-    item.rot += e.deltaY > 0 ? 0.05 : -0.05; constrainToFloor(item, true); select(item.uid);
-    setStatus(`${item.name} : ${Math.round(item.rot * 180 / Math.PI)}°`);
+    if (state.eraserOn) return; const item = getSelected() || hitItem(pointerPos(e)); if (!item) return; e.preventDefault();
+    if (e.ctrlKey || e.metaKey) {
+      item.scale = Math.min(3, Math.max(.3, item.scale * (e.deltaY > 0 ? .96 : 1.04)));
+      select(item.uid); setStatus(`${item.name} : ${Math.round(item.scale * 100)}%`);
+    } else {
+      item.rot += e.deltaY > 0 ? 0.05 : -0.05;
+      if(e.shiftKey){const step=Math.PI/12;item.rot=Math.round(item.rot/step)*step;}
+      select(item.uid); setStatus(`${item.name} : ${Math.round(item.rot * 180 / Math.PI)}°`);
+    }
   }, { passive: false });
 
   window.addEventListener("keydown", e => {
@@ -493,7 +564,7 @@
     btn.onclick = () => addItem(item.id); catalogEl.appendChild(btn);
   });
 
-  window.App = { PPM, state, canvas, ctx, setStatus, draw, roomFit, getCanvasSize, getSelected, hitItem, itemSize, resetAnalysis, getPerspectiveFactor, constrainToFloor, getSupportPoint };
+  window.App = { PPM, state, canvas, ctx, setStatus, draw, roomFit, getCanvasSize, getSelected, hitItem, itemSize, resetAnalysis, getPerspectiveFactor, constrainToFloor, getSupportPoint, clampToRoom };
   window.AppActions = { addItem, select, deleteItem, duplicateItem, renderInspector };
   window.roomFit = roomFit; window.setStatus = setStatus; window.getSelected = getSelected; window.hitItem = hitItem; window.itemSize = itemSize; window.draw = draw; window.PPM = PPM;
 
