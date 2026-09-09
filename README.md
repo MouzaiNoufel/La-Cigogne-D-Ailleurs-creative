@@ -152,3 +152,10 @@ Important: this is a deterministic compositing pipeline, not a diffusion/generat
 ## Phase 4 — AI Scene Editing
 
 Phase 4 adds smart furniture selection with SegFormer masks, LaMa inpainting, mask preview, and AI edit undo. The Phase 3E photorealistic compositing pipeline remains enabled.
+
+
+## Phase 5 — Professional Editor / Productization
+
+Phase 5 reorganizes the experience around direct manipulation rather than exposing the rendering engine as the primary UI. The room canvas is the main workspace, selected furniture gets a contextual toolbar, and the inspector focuses on size, rotation, position, duplicate and delete. Physical width/depth can be edited directly while preserving uniform scale. Camera, lighting, depth and reconstruction controls are moved behind an advanced section.
+
+Interaction improvements include smoother drag updates without rebuilding the inspector every pointer frame, larger selection affordances, contextual rotate/scale actions, keyboard-friendly controls, and a cleaner 3D inspector. The existing Phase 3A–3E rendering stack and Phase 4 AI editing workflow remain included.
