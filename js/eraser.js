@@ -38,33 +38,57 @@
     const fit = roomFit();
     if (!fit) return;
     overlay.style.display = "block";
-    octx.save();
-    octx.globalAlpha = .38;
-    octx.drawImage(selectedMask, fit.x, fit.y, fit.w, fit.h);
-    octx.globalCompositeOperation = "source-in";
-    octx.fillStyle = "rgba(217,164,65,.9)";
-    octx.fillRect(fit.x, fit.y, fit.w, fit.h);
-    octx.restore();
 
-    octx.save();
-    octx.globalAlpha = .95;
-    octx.strokeStyle = "rgba(255,220,120,.95)";
-    octx.lineWidth = 2;
-    octx.setLineDash([7,5]);
-    const mw = selectedMask.naturalWidth, mh = selectedMask.naturalHeight;
-    // Outline by sampling the mask onto a small temporary canvas.
-    const tmp = document.createElement("canvas"); tmp.width = mw; tmp.height = mh;
-    const tc = tmp.getContext("2d"); tc.drawImage(selectedMask,0,0);
-    const px = tc.getImageData(0,0,mw,mh).data;
-    const step = Math.max(1, Math.round(Math.max(mw,mh)/700));
-    octx.beginPath();
-    for (let y=step; y<mh-step; y+=step) for (let x=step; x<mw-step; x+=step) {
-      const i=(y*mw+x)*4; if(px[i+3]<80) continue;
-      const edge = px[((y-step)*mw+x)*4+3]<80 || px[((y+step)*mw+x)*4+3]<80 || px[(y*mw+x-step)*4+3]<80 || px[(y*mw+x+step)*4+3]<80;
-      if(edge){ const sx=fit.x+x/mw*fit.w, sy=fit.y+y/mh*fit.h; octx.rect(sx,sy,Math.max(1,step/mw*fit.w),Math.max(1,step/mh*fit.h)); }
+    // IMPORTANT: the backend returns a grayscale L mask. In a browser an
+    // opaque black PNG still has alpha=255 everywhere, so using RGBA alpha
+    // directly makes the whole room look selected. Convert luminance -> alpha.
+    const mw = selectedMask.naturalWidth || selectedMask.width;
+    const mh = selectedMask.naturalHeight || selectedMask.height;
+    const maskCanvas = document.createElement("canvas");
+    maskCanvas.width = mw; maskCanvas.height = mh;
+    const mc = maskCanvas.getContext("2d", { willReadFrequently: true });
+    mc.drawImage(selectedMask, 0, 0);
+    const md = mc.getImageData(0, 0, mw, mh);
+    const overlayCanvas = document.createElement("canvas");
+    overlayCanvas.width = mw; overlayCanvas.height = mh;
+    const oc = overlayCanvas.getContext("2d");
+    const od = oc.createImageData(mw, mh);
+    const threshold = 100;
+    for (let i = 0; i < md.data.length; i += 4) {
+      const v = md.data[i];
+      const a = v >= threshold ? 105 : 0;
+      od.data[i] = 235; od.data[i + 1] = 72; od.data[i + 2] = 72; od.data[i + 3] = a;
     }
-    octx.stroke(); octx.restore();
+    oc.putImageData(od, 0, 0);
+    octx.drawImage(overlayCanvas, fit.x, fit.y, fit.w, fit.h);
+
+    // Draw a real contour from the grayscale mask, not from the PNG alpha.
+    const step = Math.max(1, Math.round(Math.max(mw, mh) / 850));
+    octx.save();
+    octx.strokeStyle = "rgba(255,92,92,.98)";
+    octx.lineWidth = 2.2;
+    octx.setLineDash([6, 4]);
+    octx.beginPath();
+    for (let y = step; y < mh - step; y += step) {
+      for (let x = step; x < mw - step; x += step) {
+        const i = (y * mw + x) * 4;
+        if (md.data[i] < threshold) continue;
+        const edge =
+          md.data[((y-step)*mw+x)*4] < threshold ||
+          md.data[((y+step)*mw+x)*4] < threshold ||
+          md.data[(y*mw+x-step)*4] < threshold ||
+          md.data[(y*mw+x+step)*4] < threshold;
+        if (edge) {
+          const sx = fit.x + x / mw * fit.w;
+          const sy = fit.y + y / mh * fit.h;
+          octx.rect(sx, sy, Math.max(1, step / mw * fit.w), Math.max(1, step / mh * fit.h));
+        }
+      }
+    }
+    octx.stroke();
+    octx.restore();
   }
+
 
   function roomBlob() {
     if (!state.roomImage) throw new Error("Aucune pièce chargée");
@@ -126,7 +150,7 @@
         const data=await resp.json();
         loadRoom(data.image,`« ${selectedLabel} » effacé ✔ — ajoutez maintenant votre nouveau meuble`);
         clearSelection();
-      }catch(err){console.error(err);setStatus(`Échec de l'effacement IA : ${err.message}`);undoBtn.disabled=history.length===0;}
+      }catch(err){console.error(err);setStatus(`Échec de la suppression IA : ${err.message}`);undoBtn.disabled=history.length===0;}
       finally{busy=false;eraserBtn.disabled=false;}
       return;
     }
@@ -153,7 +177,7 @@
       const resp=await fetch(`${API}/select-mask`,{method:"POST",body:fd});
       if(!resp.ok){const e=await resp.json().catch(()=>({}));throw new Error(e.detail||`HTTP ${resp.status}`);}
       const data=await resp.json();
-      const img=new Image(); img.onload=()=>{selectedMask=img;selectedLabel=data.label||"meuble";state.aiMaskImg=img;drawMask();eraserBtn.textContent=`✨ Effacer « ${selectedLabel} »`;setStatus(`Sélection IA ✔ — « ${selectedLabel} » · cliquez à nouveau pour effacer`);}; img.src=data.mask;
+      const img=new Image(); img.onload=()=>{selectedMask=img;selectedLabel=data.label||"meuble";state.aiMaskImg=img;drawMask();eraserBtn.textContent=`✨ Confirmer suppression « ${selectedLabel} »`;setStatus(`Sélection IA ✔ — « ${selectedLabel} » · zone rouge = objet ciblé · cliquez à nouveau pour confirmer`);}; img.src=data.mask;
     }catch(err){console.error(err);setStatus(`Sélection IA impossible : ${err.message}`);}finally{busy=false;eraserBtn.disabled=false;}
   });
 
