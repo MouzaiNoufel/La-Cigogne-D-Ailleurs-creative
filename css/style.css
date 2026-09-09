@@ -242,3 +242,18 @@ body {
 .phase3e-card .phase3-title { letter-spacing:.45px; }
 .phase3e-card .hint { font-size:10.5px; }
 #p3ePreview { min-height:36px; }
+
+
+/* ---------- Phase 4 UX polish: direct-manipulation editor ---------- */
+#stage { touch-action: none; }
+.big-range { height: 22px; cursor: ew-resize; }
+.size-metric { margin-bottom: 14px; }
+.quick-scale { margin-top: -4px; margin-bottom: 12px; }
+.quick-scale .btn { min-height: 34px; padding: 7px 5px; font-size: 11px; }
+.position-field { margin-top: 4px; }
+.position-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; }
+.nudge { height:34px; border:1px solid var(--border); border-radius:8px; background:var(--bg-3); color:var(--text); font-size:16px; cursor:pointer; }
+.nudge:hover { border-color:var(--accent); color:var(--accent); }
+
+.phase3-nudge { grid-template-columns: repeat(4,1fr); }
+.phase3-nudge .btn { min-height:34px; font-size:11px; padding:7px 3px; }
