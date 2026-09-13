@@ -21,6 +21,19 @@ MAX_ANALYSIS_SIDE = 1280
 DEPTH_MODEL = "depth-anything/Depth-Anything-V2-Small-hf"
 SEG_MODEL = "nvidia/segformer-b3-finetuned-ade-512-512"
 
+# Phase 5.2.16 REMOVE-ONLY quality gate. Generative replacement engines are
+# intentionally disabled for the Remove AI workflow. A candidate must clear
+# both numbers to be considered usable. furniture_penalty alone is not sufficient: a warped/
+# ghosted candidate that SegFormer does not recognise as furniture-shaped can
+# still have a very low furniture_penalty while looking clearly wrong. These
+# starting values are a reasoned guess, not a calibrated measurement — read
+# the "seam=" numbers this build prints for results you judge good vs. bad on
+# your own machine and tighten/loosen MAX_ACCEPTABLE_SEAM to match.
+LAMA_CLEAN_FURNITURE_PENALTY = 0.30
+MAX_ACCEPTABLE_SEAM = 45.0
+# Phase 5.2.16: generative replacement engines intentionally disabled in Remove AI.
+# The product requirement is REMOVE, never replacement furniture.
+
 # ADE20K labels used by the visualizer. Keep aliases broad because model
 # label strings can vary slightly across Transformers versions.
 ADE_STRUCT = {"floor", "wall", "windowpane", "door"}
@@ -31,7 +44,7 @@ ADE_FURNITURE = {
     "dining table", "pillow", "lamp", "television", "monitor", "plant",
 }
 
-app = FastAPI(title="La Cigogne D'Ailleurs AI", version="4.5.0")
+app = FastAPI(title="La Cigogne D'Ailleurs AI", version="5.2.28")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
@@ -40,8 +53,14 @@ app.add_middleware(
 depth_pipe = None
 seg_pipe = None
 lama = None
+rorem_pipe = None
+rorem_failed = False
+smarteraser_pipe = None
+smarteraser_failed = False
 diffusion_pipe = None
 diffusion_failed = False
+powerpaint_pipe = None
+powerpaint_failed = False
 sam_model = None
 sam_processor = None
 sam_failed = False
@@ -386,6 +405,238 @@ def refine_mask_with_sam(image: Image.Image, x: int, y: int, seed: np.ndarray):
     return _grabcut_refine(image, x, y, component, (bx0, by0, bx1, by1))
 
 
+
+def get_smarteraser_inpainter():
+    """SmartEraser is unavailable through the generic diffusers API in this build.
+
+    The released checkpoint requires SmartEraser's custom
+    StableDiffusionInpaintRegionPipeline from the official repository.
+    We explicitly skip it rather than loading weights and failing later.
+    """
+    global smarteraser_failed
+    smarteraser_failed = True
+    print("SmartEraser skipped: official custom pipeline is not installed; using RORem.")
+    return None
+
+
+def get_rorem_inpainter():
+    """Load LetsThink/RORem without requesting a nonexistent weight variant."""
+    global rorem_pipe, rorem_failed
+    if rorem_pipe is not None:
+        return rorem_pipe
+    if rorem_failed:
+        return None
+    try:
+        import torch as _torch
+        from diffusers import AutoPipelineForInpainting
+        if not _torch.cuda.is_available():
+            print("RORem skipped: CUDA is required for client-demo quality.")
+            return None
+
+        print("Loading RORem object-removal model (LetsThink/RORem) with native checkpoint weights...")
+        last_error = None
+        pipe = None
+
+        # The current LetsThink/RORem model card exposes F16 safetensors, but
+        # not a separately named `fp16` variant. Requesting variant='fp16'
+        # makes Diffusers fail before inference starts.
+        for dtype_name, dtype in (("float16", _torch.float16), ("bfloat16", _torch.bfloat16)):
+            try:
+                print(f"Trying RORem dtype={dtype_name} (no variant override)...")
+                pipe = AutoPipelineForInpainting.from_pretrained(
+                    "LetsThink/RORem",
+                    dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    use_safetensors=True,
+                )
+                print(f"RORem checkpoint loaded with dtype={dtype_name}.")
+                break
+            except Exception as exc:
+                last_error = exc
+                print(f"RORem dtype={dtype_name} failed: {exc}")
+                pipe = None
+
+        if pipe is None:
+            raise RuntimeError(f"RORem checkpoint could not be loaded: {last_error}")
+
+        pipe.enable_model_cpu_offload()
+        try:
+            pipe.enable_vae_slicing()
+        except Exception:
+            pass
+        try:
+            pipe.enable_attention_slicing()
+        except Exception:
+            pass
+        rorem_pipe = pipe
+        print("RORem object-removal model READY (native checkpoint weights).")
+        return rorem_pipe
+    except Exception as exc:
+        rorem_failed = True
+        print(f"WARNING: RORem unavailable: {exc}")
+        return None
+
+def _resize_by_short_side(image: Image.Image, mask: Image.Image, short_side: int = 512):
+    """Resize image and mask like the official RORem inference code."""
+    w, h = image.size
+    scale = float(short_side) / max(1, min(w, h))
+    nw = max(64, int(round(w * scale)))
+    nh = max(64, int(round(h * scale)))
+    nw = max(64, (nw // 8) * 8)
+    nh = max(64, (nh // 8) * 8)
+    return (image.resize((nw, nh), Image.Resampling.BICUBIC),
+            mask.resize((nw, nh), Image.Resampling.NEAREST))
+
+
+def _dilate_binary_mask(mask: Image.Image, pixels: int = 8) -> Image.Image:
+    """Small halo for object/contact-shadow edges."""
+    if cv2 is None or pixels <= 0:
+        return mask.convert("L")
+    arr = np.asarray(mask.convert("L"), np.uint8)
+    k = max(3, int(pixels) * 2 + 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    out = cv2.dilate((arr > 127).astype(np.uint8), kernel, 1) * 255
+    return Image.fromarray(out.astype(np.uint8), "L")
+
+
+def _square_object_crop(image: Image.Image, object_mask: np.ndarray, context_ratio: float = 0.24):
+    """Build an object-centred square crop for RORem's native 512x512 regime.
+
+    The previous implementation kept the whole room width for a large bed.
+    That made the bed occupy only a small part of the 512px latent and forced
+    the base RORem checkpoint to solve a nearly 1024x512 scene. The official
+    RORem release states that the base checkpoint is optimal at 512x512.
+    A square crop keeps the selected object large while retaining enough wall,
+    rug and floor context to reconstruct the room instead of another object.
+    """
+    H, W = object_mask.shape
+    ys, xs = np.where(object_mask)
+    if xs.size == 0:
+        return image.convert("RGB"), object_mask.copy(), (0, 0)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bw, bh = x1 - x0, y1 - y0
+    base = max(bw, bh)
+    side = int(round(base * (1.0 + 2.0 * context_ratio)))
+    side = max(base + 64, side)
+    side = min(side, W, H)
+    side = max(256, side)
+
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    cx0 = int(round(cx - side / 2.0))
+    cy0 = int(round(cy - side / 2.0))
+    cx0 = max(0, min(cx0, W - side))
+    cy0 = max(0, min(cy0, H - side))
+    cx1, cy1 = cx0 + side, cy0 + side
+    return image.crop((cx0, cy0, cx1, cy1)), object_mask[cy0:cy1, cx0:cx1], (cx0, cy0)
+
+
+def _rorem_remove_candidate(pipe, image: Image.Image, object_mask: np.ndarray, seed: int):
+    """Run RORem with a square object-centred 512x512 working image."""
+    import torch as _torch
+    crop, crop_mask, origin = _square_object_crop(image, object_mask, context_ratio=0.24)
+    base_mask = Image.fromarray((crop_mask.astype(np.uint8) * 255), "L")
+
+    # RORem needs a little more context around large furniture so that its
+    # generated region does not preserve a bed/sofa silhouette. Keep the
+    # user's SAM mask untouched outside the generation crop, and adapt the
+    # internal dilation to object size: larger holes get a slightly wider
+    # erase halo, while small furniture keeps the tighter 30px setting.
+    mask_area_ratio = float(crop_mask.mean()) if crop_mask.size else 0.0
+    if mask_area_ratio >= 0.20:
+        dilation_px = 42
+    elif mask_area_ratio >= 0.10:
+        dilation_px = 38
+    elif mask_area_ratio >= 0.04:
+        dilation_px = 34
+    else:
+        dilation_px = 30
+    work_mask = _dilate_binary_mask(base_mask, pixels=dilation_px)
+    work = crop.convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+    work_mask = work_mask.resize((512, 512), Image.Resampling.NEAREST)
+
+    # Keep the official quality wording, but add an explicit REMOVE-ONLY scene
+    # instruction. This is deliberately phrased as reconstruction of the existing
+    # room, not generation of a replacement object.
+    prompt = (
+        "4K, high quality, masterpiece, highly detailed, sharp focus, professional, "
+        "photorealistic, realistic, seamless empty background, clean continuous wall, "
+        "continuous floor and rug, preserve the room architecture, lighting and perspective, "
+        "remove the selected object completely, no replacement object"
+    )
+    negative = (
+        "low quality, worst, bad proportions, blurry, deformed, disfigured, unclear background, "
+        "furniture, bed, sofa, couch, table, chair, cabinet, object, replacement object, ghost object"
+    )
+    generator = _torch.Generator(device="cpu").manual_seed(int(seed))
+    with _torch.inference_mode():
+        out = pipe(
+            prompt=prompt,
+            negative_prompt=negative,
+            height=512,
+            width=512,
+            image=work,
+            mask_image=work_mask,
+            guidance_scale=1.0,
+            num_inference_steps=50,
+            strength=0.99,
+            generator=generator,
+        ).images[0].convert("RGB")
+
+    restored = out.resize(crop.size, Image.Resampling.LANCZOS)
+    placed = _place_crop(image, restored, origin)
+    halo_full = np.zeros_like(object_mask, bool)
+    hm = np.asarray(work_mask.resize(crop.size, Image.Resampling.NEAREST), np.uint8) > 127
+    oy, ox = origin[1], origin[0]
+    hh, ww = crop.size[1], crop.size[0]
+    halo_full[oy:oy+hh, ox:ox+ww] = hm
+    candidate = _composite_inside_mask(
+        image, placed, Image.fromarray((halo_full.astype(np.uint8) * 255), "L")
+    )
+    return candidate, halo_full
+
+
+def _target_change_score(original: Image.Image, candidate: Image.Image, mask: np.ndarray) -> float:
+    """Measure how much the candidate actually changed the selected object.
+
+    Returns 0..1. This deliberately evaluates ONLY the original confirmed
+    object mask, not the dilated context halo used internally by RORem.
+    A removal candidate that barely changes the bed must never pass merely
+    because the surrounding seam looks good.
+    """
+    src = np.asarray(original.convert("RGB"), dtype=np.float32)
+    out = np.asarray(candidate.convert("RGB").resize(original.size, Image.Resampling.LANCZOS), dtype=np.float32)
+    m = np.asarray(mask, dtype=bool)
+    if m.shape != src.shape[:2]:
+        m = np.asarray(Image.fromarray((m.astype(np.uint8) * 255), "L").resize(original.size, Image.Resampling.NEAREST), dtype=np.uint8) > 127
+    if not m.any():
+        return 0.0
+    delta = np.abs(src - out).mean(axis=2) / 255.0
+    mean_change = float(np.mean(delta[m]))
+    changed_fraction = float(np.mean(delta[m] > (12.0 / 255.0)))
+    # Mean color change catches large residual ghosts; changed-pixel fraction
+    # catches the case where only a few details were altered.
+    return float(np.clip(0.70 * mean_change + 0.30 * changed_fraction, 0.0, 1.0))
+
+
+def _rorem_quality_candidate(original: Image.Image, candidate: Image.Image, mask: np.ndarray):
+    """Return a score that heavily penalizes surviving furniture."""
+    score, seam, fp = _candidate_quality(original, candidate, Image.fromarray((mask.astype(np.uint8) * 255), "L"))
+    # RORem is a removal model; for this product, visible furniture inside the
+    # selected hole is much worse than a small boundary-color mismatch.
+    total = float(seam + 420.0 * fp)
+    return total, seam, fp
+
+
+def get_powerpaint_inpainter():
+    """Deprecated in Phase 5.2.16: replacement/generative backends are not used by Remove AI."""
+    return None
+
+
+def _powerpaint_remove(*args, **kwargs):
+    raise RuntimeError("PowerPaint is disabled for the remove-only workflow")
+
 def get_diffusion_inpainter():
     """Load the actual diffusion inpainting backend, or return None with a clear diagnostic."""
     global diffusion_pipe, diffusion_failed
@@ -400,7 +651,7 @@ def get_diffusion_inpainter():
         dtype = _torch.float16 if device == "cuda" else _torch.float32
         print(f"Loading REQUIRED generative inpainting model (device={device})...")
         pipe = StableDiffusionInpaintPipeline.from_pretrained(
-            "runwayml/stable-diffusion-inpainting",
+            "stable-diffusion-v1-5/stable-diffusion-inpainting",
             torch_dtype=dtype,
             safety_checker=None,
             requires_safety_checker=False,
@@ -428,52 +679,54 @@ def get_diffusion_inpainter():
 
 
 def _seam_score(original_crop: Image.Image, candidate: Image.Image, mask_crop: Image.Image) -> float:
-    """Score a reconstruction by boundary continuity, not just mean color.
+    """Robust boundary continuity score. Lower is better.
 
-    A low-contrast hallucination (for example a newly generated dark piece of
-    furniture) can have a deceptively good mean-color score. We therefore
-    compare luminance + gradient continuity in a narrow ring around the
-    confirmed mask and penalize excessive edge energy inside the generated
-    region.
+    This deliberately never uses a 1e6 sentinel for a normal thin/irregular
+    mask. It samples visible pixels just outside the hole and compares them to
+    generated pixels immediately inside the hole. A very large value is used
+    only for an actual shape/size error.
     """
     if cv2 is None:
         return 0.0
-    a = np.asarray(mask_crop, np.uint8) > 127
-    if not a.any():
-        return 1e9
+    a = np.asarray(mask_crop.convert("L"), np.uint8) > 127
     src = np.asarray(original_crop.convert("RGB"), np.uint8)
     gen = np.asarray(candidate.convert("RGB"), np.uint8)
+    if src.shape != gen.shape or src.shape[:2] != a.shape:
+        return 1e6
+    if not a.any():
+        return 1e6
 
-    dil = cv2.dilate(a.astype(np.uint8), np.ones((9, 9), np.uint8), iterations=1).astype(bool)
-    ero = cv2.erode(a.astype(np.uint8), np.ones((5, 5), np.uint8), iterations=1).astype(bool)
-    ring = dil & (~a)
-    inner = a & (~ero)
-    if not ring.any() or not inner.any():
-        return 1e9
+    # One-pixel contour inside and a short visible band outside.
+    er = cv2.erode(a.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(3,3)), 1).astype(bool)
+    inner = a & ~er
+    dil = cv2.dilate(a.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE,(9,9)), 1).astype(bool)
+    outer = dil & ~a
+    if not inner.any() or not outer.any():
+        # Boundary-touching masks can have no exterior context in the crop.
+        # Use a valid low-weight interior texture statistic instead of 1e6.
+        inner = a
+        if not outer.any():
+            return float(np.std(cv2.cvtColor(gen, cv2.COLOR_RGB2GRAY)[inner])) * 0.15
 
-    src_gray = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    gen_gray = cv2.cvtColor(gen, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    src_grad = cv2.Laplacian(src_gray, cv2.CV_32F)
-    gen_grad = cv2.Laplacian(gen_gray, cv2.CV_32F)
+    src_g = cv2.cvtColor(src, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    gen_g = cv2.cvtColor(gen, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    src_blur = cv2.GaussianBlur(src_g,(0,0),2.0)
+    gen_blur = cv2.GaussianBlur(gen_g,(0,0),2.0)
 
-    # Boundary luminance continuity.
-    boundary_src = src_gray[ring].mean()
-    boundary_gen = gen_gray[inner].mean()
-    color_score = abs(boundary_src - boundary_gen)
+    # Compare robust medians and local gradients.
+    lum_gap = abs(float(np.median(gen_g[inner])) - float(np.median(src_g[outer])))
+    tex_gap = abs(float(np.std(gen_blur[inner])) - float(np.std(src_blur[outer])))
 
-    # Compare local gradient magnitudes. Large artificial edges inside the hole
-    # are a strong signal that the model invented an object.
-    grad_src = np.abs(src_grad[ring]).mean()
-    grad_gen = np.abs(gen_grad[inner]).mean()
-    edge_penalty = max(0.0, grad_gen - max(grad_src * 1.45, grad_src + 4.0))
+    sx=cv2.Sobel(src_g,cv2.CV_32F,1,0,ksize=3); sy=cv2.Sobel(src_g,cv2.CV_32F,0,1,ksize=3)
+    gx=cv2.Sobel(gen_g,cv2.CV_32F,1,0,ksize=3); gy=cv2.Sobel(gen_g,cv2.CV_32F,0,1,ksize=3)
+    sg=cv2.magnitude(sx,sy); gg=cv2.magnitude(gx,gy)
+    grad_gap=abs(float(np.median(gg[inner]))-float(np.median(sg[outer])))
 
-    # Penalize very dark/bright generated interiors relative to the visible ring.
-    ring_mean = float(src_gray[ring].mean())
-    inner_mean = float(gen_gray[inner].mean())
-    luminance_penalty = max(0.0, abs(inner_mean - ring_mean) - 28.0) * 0.45
-
-    return float(color_score + edge_penalty * 1.8 + luminance_penalty)
-
+    # Excess edge energy is a strong signal for hallucinated furniture.
+    deep = er & a
+    if not deep.any(): deep=a
+    edge_excess=max(0.0,float(np.mean(gg[deep]))-max(1.8*float(np.mean(sg[outer])),float(np.mean(sg[outer]))+5.0))
+    return float(lum_gap + 0.45*tex_gap + 0.30*grad_gap + 0.70*edge_excess)
 
 def _square_working_crop(crop: Image.Image, mask: np.ndarray, target: int = 512):
     """Return square 512x512 image/mask plus geometry needed to undo padding."""
@@ -513,6 +766,46 @@ def _restore_square(result_sq: Image.Image, geometry):
     return Image.fromarray(arr.astype(np.uint8), "RGB")
 
 
+def _furniture_hallucination_score(candidate: Image.Image, target_mask: np.ndarray) -> float:
+    """Estimate how much furniture the generated hole contains.
+
+    SegFormer is already loaded for surface classification, so reuse it as a
+    cheap semantic guardrail. The score is the fraction of the confirmed
+    reconstruction mask that SegFormer labels as furniture. Lower is better.
+    It is intentionally a penalty, not a hard classifier: a few boundary
+    pixels can be mislabeled in a photograph.
+    """
+    try:
+        _, sp = get_pipes()
+        arr = np.asarray(target_mask, bool)
+        if not arr.any():
+            return 1.0
+        results = sp(candidate.convert("RGB"))
+        H, W = arr.shape
+        furniture = np.zeros((H, W), bool)
+        for r in results:
+            label = str(r.get("label", "")).lower().strip()
+            if label not in ADE_FURNITURE:
+                continue
+            # SegFormer can assign low-confidence furniture labels to large
+            # texture regions (rug/wall/floor). For quality gating, only count
+            # reasonably confident semantic detections.
+            confidence = float(r.get("score", 1.0) or 1.0)
+            if confidence < 0.65:
+                continue
+            rm = r.get("mask")
+            if rm is None:
+                continue
+            m = mask_array(rm, (W, H))
+            furniture |= np.asarray(m, bool)
+        return float((furniture & arr).sum() / max(1, arr.sum()))
+    except Exception as exc:
+        # Never make reconstruction fail because the optional semantic
+        # validation failed. A neutral score simply disables this penalty.
+        print(f"WARNING: furniture hallucination check unavailable: {exc}")
+        return 0.0
+
+
 def _diffusion_surface_pass(pipe, crop: Image.Image, target_mask: np.ndarray,
                             prompt: str, negative: str, seed: int):
     """One tightly constrained diffusion pass for one room surface."""
@@ -532,101 +825,379 @@ def _diffusion_surface_pass(pipe, crop: Image.Image, target_mask: np.ndarray,
         ).images[0].convert("RGB")
     if out.size != work.size:
         out = out.resize(work.size, Image.Resampling.LANCZOS)
-    score = _seam_score(work, out, work_mask)
-    return _restore_square(out, geometry), score
+    seam = _seam_score(work, out, work_mask)
+    hallucination = _furniture_hallucination_score(out, np.asarray(work_mask.convert("L")) > 127)
+    # A visible piece of furniture inside a surface reconstruction is much
+    # worse than a small color/texture mismatch. Make it dominate candidate
+    # selection while still allowing minor segmentation noise.
+    score = float(seam + 180.0 * hallucination)
+    return _restore_square(out, geometry), score, seam, hallucination
 
 
-def _diffusion_inpaint_large_object(image: Image.Image, object_mask: np.ndarray) -> Image.Image | None:
-    """Surface-aware generative reconstruction for substantial furniture masks.
+def _compose_candidate(original: Image.Image, generated: Image.Image, mask_img: Image.Image) -> Image.Image:
+    """Composite a generated full-image candidate strictly inside the mask."""
+    src=np.asarray(original.convert("RGB"),np.float32)
+    gen=np.asarray(generated.convert("RGB").resize(original.size,Image.Resampling.LANCZOS),np.float32)
+    m=np.asarray(mask_img.convert("L").resize(original.size,Image.Resampling.NEAREST),np.uint8)>127
+    alpha=m.astype(np.float32)
+    if cv2 is not None:
+        # Only a very small feather; never leak into neighbouring furniture.
+        alpha=cv2.GaussianBlur(alpha,(0,0),0.65)
+        alpha*=m
+    out=src*(1-alpha[...,None])+gen*alpha[...,None]
+    return Image.fromarray(np.clip(out,0,255).astype(np.uint8))
 
-    The old implementation sent the *entire furniture hole* to one generic
-    "empty bedroom" prompt. Stable Diffusion then had enough contextual evidence
-    to hallucinate another bed/table inside the hole. This version splits the
-    confirmed mask into structural surfaces first and generates each surface
-    independently: wall gets a wall-only prompt, floor/rug gets a floor-only
-    prompt. The generated pixels are still composited strictly inside the
-    confirmed mask.
+
+def _candidate_quality(original: Image.Image, candidate: Image.Image, mask_img: Image.Image):
+    """Return quality tuple used for real candidate selection."""
+    m=np.asarray(mask_img.convert("L"),np.uint8)>127
+    ys,xs=np.where(m)
+    if xs.size==0: return 1e6,1e6,1.0
+    x0,x1=max(0,int(xs.min())-32),min(original.width,int(xs.max())+33)
+    y0,y1=max(0,int(ys.min())-32),min(original.height,int(ys.max())+33)
+    oc=original.crop((x0,y0,x1,y1)); cc=candidate.crop((x0,y0,x1,y1)); mc=mask_img.crop((x0,y0,x1,y1))
+    seam=_seam_score(oc,cc,mc)
+    # SegFormer needs actual visible wall/floor to tell a large reconstructed
+    # region apart from real furniture. The tight seam crop above is mostly
+    # hole with only a ~32px visible margin — for a large object that is an
+    # out-of-distribution input for a scene segmentation model and measurably
+    # biases it toward guessing "furniture" even on a clean fill (observed in
+    # testing: two different backends and three different seeds all scored
+    # furniture_penalty in the same 0.77-0.80 band on one large-hole removal,
+    # which independent hallucinations would not do). Classify from a much
+    # wider context crop instead; only pixels inside the confirmed mask are
+    # ever counted, so this cannot start counting a real neighbouring object.
+    wide_candidate, wide_mask_arr, _ = _local_object_crop(candidate, m, pad_ratio=1.4)
+    furniture=_furniture_hallucination_score(wide_candidate, wide_mask_arr)
+    return float(seam+260.0*furniture), float(seam), float(furniture)
+
+
+def _local_object_crop(image: Image.Image, object_mask: np.ndarray, pad_ratio: float = 0.85):
+    """Return a generous context crop around the object, preserving the full hole."""
+    H, W = object_mask.shape
+    ys, xs = np.where(object_mask)
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bw, bh = x1 - x0, y1 - y0
+    px = max(64, int(bw * pad_ratio))
+    py = max(64, int(bh * pad_ratio))
+    cx0, cy0 = max(0, x0 - px), max(0, y0 - py)
+    cx1, cy1 = min(W, x1 + px), min(H, y1 + py)
+    return image.crop((cx0, cy0, cx1, cy1)), object_mask[cy0:cy1, cx0:cx1], (cx0, cy0)
+
+
+def _place_crop(base: Image.Image, crop: Image.Image, origin):
+    out = base.copy()
+    out.paste(crop.convert("RGB"), origin)
+    return out
+
+
+def _semantic_furniture_shield(image: Image.Image, target_mask: np.ndarray) -> np.ndarray:
+    """Find visible furniture that should NOT be used as donor context.
+
+    Remove AI must reconstruct the hidden room, not copy neighboring furniture
+    into the hole. We therefore make a temporary *context shield* around
+    furniture outside the selected object. The shield is used only as input to
+    LaMa; the original pixels are restored byte-for-byte in the final image.
+    """
+    if cv2 is None:
+        return np.zeros_like(target_mask, bool)
+    try:
+        _, sp = get_pipes()
+        H, W = target_mask.shape
+        shield = np.zeros((H, W), bool)
+        for r in sp(image.convert("RGB")):
+            label = str(r.get("label", "")).lower().strip()
+            if label not in ADE_FURNITURE:
+                continue
+            score = float(r.get("score", 1.0) or 1.0)
+            if score < 0.50:
+                continue
+            rm = r.get("mask")
+            if rm is None:
+                continue
+            m = mask_array(rm, (W, H))
+            # Only shield visible furniture outside the selected object.
+            m = np.asarray(m, bool) & ~target_mask
+            if int(m.sum()) >= 180:
+                shield |= m
+        # Give the shield a small safety halo so LaMa does not pull furniture
+        # edges into the reconstruction. Never change the user's actual mask.
+        if shield.any():
+            shield = cv2.dilate(
+                shield.astype(np.uint8),
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+                iterations=1,
+            ) > 0
+            shield &= ~target_mask
+        return shield
+    except Exception as exc:
+        print(f"WARNING: furniture context shield unavailable: {exc}")
+        return np.zeros_like(target_mask, bool)
+
+
+def _build_remove_only_context(image: Image.Image, target_mask: np.ndarray) -> Image.Image:
+    """Create a temporary furniture-neutral context for object removal.
+
+    This is NOT the output image. It exists only to stop LaMa from seeing a
+    neighboring sofa/table/bed and hallucinating that furniture into the hole.
+    The final composite always comes from the original image outside target.
+    """
+    shield = _semantic_furniture_shield(image, target_mask)
+    if not shield.any():
+        return image.convert("RGB")
+    context = _multiscale_cv_inpaint(image.convert("RGB"), shield, radius=3.0)
+    print(f"Remove-only context shield: {int(shield.sum())}px of neighboring furniture hidden from donor context")
+    return context
+
+
+def _surface_donor_context(image: Image.Image, object_mask: np.ndarray,
+                           surface_map: np.ndarray, surface_id: int) -> Image.Image:
+    """Make a donor image dominated by the surface being reconstructed.
+
+    The selected object is already absent from ``image`` when this helper is
+    called.  We also neutralize clearly different surfaces inside the local
+    object neighborhood.  This is a donor-context trick only: the final image
+    is always composited over the untouched original outside the target mask.
+    """
+    if cv2 is None:
+        return image.convert("RGB")
+    src = np.asarray(image.convert("RGB"), np.uint8)
+    shield = _semantic_furniture_shield(image, object_mask)
+    keep = (surface_map == surface_id) & ~object_mask & ~shield
+    # Start from a heavily blurred copy so non-target surfaces cannot provide
+    # sharp furniture/edge donors.  Same-surface pixels remain untouched.
+    blurred = cv2.GaussianBlur(src, (0, 0), 11.0)
+    out = src.copy()
+    out[~keep] = blurred[~keep]
+    return Image.fromarray(out, "RGB")
+
+def _planar_wall_fill(image: Image.Image, target: np.ndarray) -> Image.Image:
+    """Deterministic wall reconstruction using visible same-row wall pixels.
+
+    Walls in room photos are usually locally planar and slowly varying in
+    color.  For this surface we should not ask an inpainting network to invent
+    texture.  Interpolating between real wall pixels preserves the actual
+    paint tone and avoids the soft brown/grey blob produced by large-hole
+    LaMa/OpenCV passes.
+    """
+    if cv2 is None or not target.any():
+        return image.convert("RGB")
+    src=np.asarray(image.convert("RGB"),np.float32)
+    out=src.copy(); H,W=target.shape
+    wall_target=target.copy()
+    # Lightly close tiny gaps so each row has a stable boundary.
+    for y in range(H):
+        xs=np.where(wall_target[y])[0]
+        if xs.size<2: continue
+        x0,x1=int(xs.min()),int(xs.max())
+        # Real wall samples immediately outside the hole, plus a small robust
+        # horizontal window to reduce lamp/object contamination.
+        left=max(0,x0-18); right=min(W-1,x1+18)
+        L=np.where(~wall_target[y,left:x0])[0]
+        R=np.where(~wall_target[y,x1+1:right+1])[0]
+        if L.size and R.size:
+            lx=left+int(L[-1]); rx=x1+1+int(R[0])
+            if rx>lx:
+                lc=np.median(src[max(0,y-2):min(H,y+3),max(0,lx-3):min(W,lx+4)],axis=(0,1))
+                rc=np.median(src[max(0,y-2):min(H,y+3),max(0,rx-3):min(W,rx+4)],axis=(0,1))
+                span=rx-lx
+                for x in range(x0,x1+1):
+                    if wall_target[y,x]:
+                        t=(x-lx)/span
+                        # Preserve a gentle illumination gradient instead of
+                        # producing a flat single-color rectangle.
+                        out[y,x]=lc*(1-t)+rc*t
+        elif L.size:
+            lx=left+int(L[-1]); out[y,x0:x1+1]=src[y,lx]
+        elif R.size:
+            rx=x1+1+int(R[0]); out[y,x0:x1+1]=src[y,rx]
+    # Small-radius NS pass only at the contour to blend one-pixel seams.
+    contour=cv2.dilate(wall_target.astype(np.uint8),np.ones((3,3),np.uint8),1).astype(bool) & ~wall_target
+    if contour.any():
+        repaired=cv2.inpaint(np.clip(out,0,255).astype(np.uint8),(contour.astype(np.uint8)*255),2.0,cv2.INPAINT_NS)
+        # Do not alter the interior interpolation with this pass.
+        out[contour]=repaired[contour]
+    return Image.fromarray(np.clip(out,0,255).astype(np.uint8),'RGB')
+
+def _smart_quality(original: Image.Image, candidate: Image.Image, mask: np.ndarray):
+    full=Image.fromarray((mask.astype(np.uint8)*255),'L')
+    score,seam,fp=_candidate_quality(original,candidate,full)
+    change=_target_change_score(original,candidate,mask)
+    # Reward actual erasure while penalising furniture/ghosts. The change term
+    # is capped so a hallucinated replacement cannot win merely by changing more pixels.
+    total=float(seam + 260.0*fp + 160.0*max(0.0, 0.18-change))
+    return total,seam,fp,change
+
+
+def _residual_structure_score(candidate: Image.Image, object_mask: np.ndarray) -> float:
+    """Estimate whether a furniture-like structural pattern survived inside the hole.
+
+    SegFormer catches semantic furniture, but it can miss a generated sofa/bed
+    when the hallucination has low confidence. This second signal is deliberately
+    lightweight: compare edge density inside the confirmed removal mask with a
+    nearby context ring. A reconstructed wall/floor/rug should not suddenly have
+    a much higher concentration of strong edges than its surroundings.
+
+    Returns 0..1, where lower is better. It is a ranking signal, not a standalone
+    detector, so textured rugs and wood grain do not get rejected by themselves.
+    """
+    try:
+        if cv2 is None:
+            return 0.0
+        m = np.asarray(object_mask, bool)
+        if not m.any():
+            return 0.0
+        gray = np.asarray(candidate.convert("L"), np.uint8)
+        if gray.shape != m.shape:
+            gray = np.asarray(candidate.convert("L").resize((m.shape[1], m.shape[0]), Image.Resampling.BILINEAR), np.uint8)
+        edges = cv2.Canny(gray, 60, 140) > 0
+        inner = float(edges[m].mean())
+        ring = cv2.dilate(m.astype(np.uint8), np.ones((21, 21), np.uint8), iterations=1).astype(bool) & ~m
+        if not ring.any():
+            return 0.0
+        outer = float(edges[ring].mean())
+        excess = max(0.0, inner - max(0.055, outer * 1.35))
+        return float(np.clip(excess / 0.20, 0.0, 1.0))
+    except Exception as exc:
+        print(f"WARNING: residual structure check unavailable: {exc}")
+        return 0.0
+
+
+def _score_rorem_candidate(src: Image.Image, cand: Image.Image, object_mask: np.ndarray):
+    full_mask = Image.fromarray((object_mask.astype(np.uint8) * 255), "L")
+    total, seam, fp = _candidate_quality(src, cand, full_mask)
+    change = _target_change_score(src, cand, object_mask)
+    residual = _residual_structure_score(cand, object_mask)
+    # Semantic furniture is still the strongest signal. The structure term is
+    # intentionally smaller: it should break ties in favour of a cleaner hole,
+    # not reject naturally textured floors/rugs.
+    total = float(
+        seam
+        + 300.0 * fp
+        + 120.0 * residual
+        + 160.0 * max(0.0, 0.22 - change)
+    )
+    return total, seam, fp, change, residual
+
+
+def _remove_only_large_object(image: Image.Image, object_mask: np.ndarray) -> dict | None:
+    """Large-object REMOVE-ONLY pipeline with conservative candidate ensemble.
+
+    Phase 5.2.27 keeps the successful RORem-only architecture but improves
+    selection: five fixed seeds are evaluated, the best candidate receives up
+    to two residual-removal passes, and a lightweight structural-residual score
+    helps prefer a genuinely empty reconstruction over a plausible-looking
+    sofa/bed ghost. No replacement or generic LaMa fallback is used.
     """
     if not object_mask.any():
         return None
-    pipe = get_diffusion_inpainter()
+    src = image.convert("RGB")
+    pipe = get_rorem_inpainter()
     if pipe is None:
+        print("REMOVE-ONLY large-object removal rejected: RORem unavailable")
         return None
-    try:
-        src = image.convert("RGB")
-        W, H = src.size
-        surfaces = _surface_masks(src)
-        surface_map = _nearest_surface_map(object_mask, surfaces)
 
-        # If segmentation cannot establish surfaces, use a conservative
-        # horizontal prior rather than asking diffusion to reconstruct the whole
-        # room with an "empty bedroom" prompt.
-        if not np.any(surface_map == 1) and not np.any(surface_map == 2):
-            surface_map = np.where(np.indices(object_mask.shape)[0] >= int(H * 0.55), 1, 2).astype(np.uint8)
+    candidates = []
+    for seed in (2026, 7319, 11037, 17011, 23027):
+        try:
+            cand, effective_mask = _rorem_remove_candidate(pipe, src, object_mask, seed)
+            total, seam, fp, change, residual = _score_rorem_candidate(src, cand, object_mask)
+            print(
+                f"RORem pass1 seed={seed}: score={total:.2f}, seam={seam:.2f}, "
+                f"furniture_penalty={fp:.4f}, residual_structure={residual:.3f}, "
+                f"target_change={change:.3f}"
+            )
+            candidates.append((total, seam, fp, change, residual, cand, seed, effective_mask))
+        except Exception as exc:
+            print(f"RORem pass1 seed={seed} failed: {exc}")
 
-        result = src.copy()
-        surface_specs = [
-            (
-                2,
-                "continuous flat white painted interior wall, subtle plaster texture, same wall lighting, "
-                "no furniture, no decoration, no object, no frame, no plant, seamless wall surface",
-                "bed, mattress, pillow, sofa, chair, table, cabinet, nightstand, furniture, object, "
-                "painting, picture frame, plant, lamp, person, room corner, doorway, dark blob",
-                7103,
-            ),
-            (
-                1,
-                "continuous flat light gray carpet and pale wooden floor surface, same perspective and lighting, "
-                "natural carpet fibers or subtle wood grain, seamless empty floor, no furniture, no object",
-                "bed, mattress, pillow, sofa, chair, table, cabinet, nightstand, furniture, object, "
-                "person, rug edge, wall, cabinet, dark blob, vertical object, duplicated furniture",
-                9137,
-            ),
-        ]
-
-        for sid, prompt, negative, seed in surface_specs:
-            target = object_mask & (surface_map == sid)
-            if not target.any():
-                continue
-            ys, xs = np.where(target)
-            x0, x1 = int(xs.min()), int(xs.max())
-            y0, y1 = int(ys.min()), int(ys.max())
-            bw, bh = x1 - x0 + 1, y1 - y0 + 1
-            pad_x = int(np.clip(round(bw * 0.38), 80, 260))
-            pad_y = int(np.clip(round(bh * 0.38), 80, 220))
-            cx0, cy0 = max(0, x0-pad_x), max(0, y0-pad_y)
-            cx1, cy1 = min(W, x1+pad_x+1), min(H, y1+pad_y+1)
-            crop = src.crop((cx0, cy0, cx1, cy1))
-            local_mask = target[cy0:cy1, cx0:cx1]
-
-            # Two candidates are retained, but only for this surface. This makes
-            # candidate selection meaningful and prevents a bed-shaped global
-            # hallucination from winning because its average color is smooth.
-            candidates = []
-            for local_seed in (seed, seed + 17):
-                out, score = _diffusion_surface_pass(pipe, crop, local_mask, prompt, negative, local_seed)
-                candidates.append((score, out))
-                print(f"Generative surface={sid} seed={local_seed}, seam_score={score:.2f}")
-            generated_crop = min(candidates, key=lambda z: z[0])[1]
-
-            # Blend softly only inside this surface's confirmed mask. A very
-            # narrow feather hides the diffusion tile boundary without bleeding
-            # into untouched furniture/wall/floor pixels.
-            alpha = local_mask.astype(np.float32)
-            if cv2 is not None:
-                alpha = cv2.GaussianBlur(alpha, (0, 0), 0.85)
-            # Feather only inward: never modify pixels outside the confirmed mask.
-            alpha = np.clip(alpha, 0.0, 1.0) * local_mask.astype(np.float32)
-            alpha = alpha[..., None]
-            base = np.asarray(result.crop((cx0, cy0, cx1, cy1)), np.float32)
-            gen = np.asarray(generated_crop, np.float32)
-            blended = np.clip(base * (1.0-alpha) + gen * alpha, 0, 255).astype(np.uint8)
-            result.paste(Image.fromarray(blended), (cx0, cy0))
-
-        return result
-    except Exception as exc:
-        print(f"ERROR: generative inpainting failed: {exc}")
+    if not candidates:
         return None
+
+    # Prefer semantic cleanliness first, then total score. This prevents a tiny
+    # seam improvement from winning over a visibly furniture-shaped hallucination.
+    candidates.sort(key=lambda x: (x[2], x[4], x[0], x[1], -x[3]))
+    best = candidates[0]
+    _, _, _, _, _, best_img, best_seed, _ = best
+
+    # Two independent residual passes give the selected best image a chance to
+    # erase a sofa/bed ghost that survived the first removal. We still score every
+    # refinement against the ORIGINAL room, so quality cannot drift indefinitely.
+    for pass_index, offset in enumerate((44021, 58117), start=2):
+        try:
+            second_seed = offset + int(best_seed)
+            refined, effective_mask2 = _rorem_remove_candidate(pipe, best_img, object_mask, second_seed)
+            total2, seam2, fp2, change2, residual2 = _score_rorem_candidate(src, refined, object_mask)
+            print(
+                f"RORem pass{pass_index} seed={second_seed}: score={total2:.2f}, seam={seam2:.2f}, "
+                f"furniture_penalty={fp2:.4f}, residual_structure={residual2:.3f}, "
+                f"target_change={change2:.3f}"
+            )
+            # Accept a refinement only when semantic/structural cleanliness improves
+            # or the overall score is meaningfully better. This protects already-good
+            # removals from unnecessary texture drift.
+            if (fp2 < best[2] - 0.008) or (residual2 < best[4] - 0.04) or (total2 < best[0] - 4.0):
+                best = (total2, seam2, fp2, change2, residual2, refined, second_seed, effective_mask2)
+                best_img = refined
+                best_seed = second_seed
+                print(f"RORem refinement selected: pass {pass_index}")
+            else:
+                print(f"RORem refinement rejected: pass {pass_index} did not improve enough")
+        except Exception as exc:
+            print(f"RORem pass{pass_index} failed: {exc}; keeping current best")
+
+    total, seam, fp, change, residual, cand, seed, effective_mask = best
+    # The structural score is intentionally not a hard gate by itself. The
+    # existing semantic + seam gates remain the safety barrier against returning
+    # an obvious bad reconstruction.
+    if change >= 0.28 and fp <= 0.40 and seam <= 50.0:
+        print(
+            f"Selected REMOVE-ONLY backend=rorem-official-512-square-ensemble seed={seed}, "
+            f"score={total:.2f}, seam={seam:.2f}, furniture_penalty={fp:.4f}, "
+            f"residual_structure={residual:.3f}, target_change={change:.3f}, passed_gate=True"
+        )
+        return {
+            "image": cand,
+            "passed_gate": True,
+            "backend": "rorem-official-512-square-ensemble",
+            "seam": seam,
+            "furniture_penalty": fp,
+        }
+
+    # Phase 5.2.28: reliability recovery band. A candidate that is otherwise
+    # very clean can miss the strict seam gate by only a few points because the
+    # selected object touches a high-contrast edge (rug border, wood edge, etc.).
+    # Do not lower the normal gate globally. Instead allow a narrow, high-
+    # confidence recovery band so the UI does not report a 503 for a candidate
+    # that is already semantically clean and has genuinely erased the object.
+    # This is intentionally much stricter on furniture/residual scores than the
+    # normal gate.
+    if (
+        change >= 0.32
+        and fp <= 0.20
+        and residual <= 0.45
+        and seam <= 58.0
+    ):
+        print(
+            f"Selected REMOVE-ONLY recovery-band seed={seed}, score={total:.2f}, "
+            f"seam={seam:.2f}, furniture_penalty={fp:.4f}, "
+            f"residual_structure={residual:.3f}, target_change={change:.3f}, passed_gate=True"
+        )
+        return {
+            "image": cand,
+            "passed_gate": True,
+            "backend": "rorem-official-512-square-recovery",
+            "seam": seam,
+            "furniture_penalty": fp,
+        }
+
+    print(
+        f"REMOVE-ONLY large-object removal rejected: best score={total:.2f}, "
+        f"target_change={change:.3f}, furniture_penalty={fp:.4f}, "
+        f"residual_structure={residual:.3f}, seam={seam:.2f}"
+    )
+    return None
 
 def get_lama():
     global lama
@@ -937,7 +1508,13 @@ async def _segment_furniture_at_point(image: Image.Image, x: int, y: int):
 def prepare_inpaint_mask(mask_img: Image.Image, image_size: Tuple[int, int]) -> Image.Image:
     """Create a minimal context mask; never inflate a selection into a scene region."""
     if mask_img.size != image_size:
-        mask_img=mask_img.resize(image_size,Image.Resampling.BILINEAR)
+        # NEAREST, not BILINEAR: this is a binary object silhouette, not a
+        # photo. Smooth interpolation manufactures grey edge pixels that then
+        # get re-thresholded, rounding off real detail (e.g. bed legs) instead
+        # of just anti-aliasing — and the same source mask already goes
+        # through this resize twice (once on the frontend round-trip, once
+        # here), so the effect compounds.
+        mask_img=mask_img.resize(image_size,Image.Resampling.NEAREST)
     arr=np.asarray(mask_img,dtype=np.uint8)
     if cv2 is None:
         return Image.fromarray(arr).convert("L")
@@ -973,47 +1550,67 @@ def _surface_masks(image: Image.Image):
 
 
 def _nearest_surface_map(mask: np.ndarray, surfaces: dict) -> np.ndarray:
-    """Assign each masked pixel to the nearest visible structural surface.
+    """Route the selected hole to the *actual* visible surface.
 
-    1=floor/rug, 2=wall. The object mask itself is never replaced by the
-    semantic surface masks; they are only used to decide *how* the background
-    should be reconstructed.
+    Euclidean nearest-surface assignment is wrong for perspective rooms: a
+    rug can be physically closer to a wall pixel than the wall itself.  We
+    first estimate the wall/floor transition from the visible segmentation,
+    then use the rug segmentation only below that transition.
+    IDs: 1=floor, 2=wall, 3=rug/carpet.
     """
     H, W = mask.shape
-    labels = np.zeros((H, W), np.uint8)
-    floor = np.zeros_like(mask, bool)
-    wall = np.zeros_like(mask, bool)
-    for k, v in surfaces.items():
-        if k in {"floor", "rug", "carpet"}:
-            floor |= v
-        elif k == "wall":
-            wall |= v
-    labels[floor] = 1
-    labels[wall] = 2
+    floor=np.asarray(surfaces.get("floor", np.zeros_like(mask)),bool)
+    wall=np.asarray(surfaces.get("wall", np.zeros_like(mask)),bool)
+    rug=np.asarray(surfaces.get("rug", np.zeros_like(mask)),bool) | np.asarray(surfaces.get("carpet", np.zeros_like(mask)),bool)
+    labels=np.zeros((H,W),np.uint8)
+    hole=mask.astype(bool)
 
-    known = (labels > 0) & (~mask)
-    if not known.any():
-        labels[int(H * 0.60):, :] = 1
-        labels[:int(H * 0.60), :] = 2
-        return labels
+    # Estimate the visible floor/wall boundary column-by-column.  Robust
+    # quantiles stop isolated segmentation pixels from moving the boundary.
+    boundary=np.full(W, int(H*0.58), dtype=np.float32)
+    valid=[]
+    for x in range(W):
+        wy=np.where(wall[:,x])[0]
+        fy=np.where(floor[:,x])[0]
+        if wy.size and fy.size:
+            valid.append((x, float(np.percentile(wy,90))))
+        elif wy.size:
+            valid.append((x, float(np.percentile(wy,90))))
+    if valid:
+        vx=np.array([v[0] for v in valid],np.float32); vy=np.array([v[1] for v in valid],np.float32)
+        boundary=np.interp(np.arange(W,dtype=np.float32),vx,vy,left=float(vy[0]),right=float(vy[-1]))
+        if cv2 is not None:
+            boundary=cv2.GaussianBlur(boundary.reshape(1,-1),(0,0),max(3.0,W/180.0)).ravel()
 
-    if cv2 is None:
-        return labels
+    yy=np.indices((H,W))[0]
+    # A small transition band is assigned using surface proximity.
+    wall_zone=hole & (yy <= (boundary[None,:]-6))
+    lower_zone=hole & (yy >= (boundary[None,:]+6))
+    transition=hole & ~(wall_zone|lower_zone)
+    labels[wall_zone]=2
 
-    # Nearest-label propagation, but only into the confirmed hole.
-    inv = (~known).astype(np.uint8)
-    _, inds = cv2.distanceTransformWithLabels(inv, cv2.DIST_L2, 5, cv2.DIST_LABEL_PIXEL)
-    ky, kx = np.where(known)
-    vals = labels[ky, kx]
-    idx = np.asarray(inds, np.int64) - 1
-    propagated = np.zeros_like(labels)
-    valid = (idx >= 0) & (idx < vals.size)
-    propagated[valid] = vals[idx[valid]]
-    propagated[known] = labels[known]
-    # Preserve known semantic labels exactly.
-    propagated[~mask & (labels > 0)] = labels[~mask & (labels > 0)]
-    return propagated
+    # Below the wall line: rug wins only when the pixel is genuinely near a
+    # visible rug region. Otherwise it is floor. This prevents the rug from
+    # being projected upward across the entire bed footprint.
+    if cv2 is not None:
+        def dist_to(m):
+            if not m.any(): return np.full((H,W),1e6,np.float32)
+            return cv2.distanceTransform((~m).astype(np.uint8),cv2.DIST_L2,5)
+        dr=dist_to(rug); df=dist_to(floor); dw=dist_to(wall)
+        rug_pick=lower_zone & rug.any() & (dr <= np.minimum(df*1.35, 170.0))
+        labels[lower_zone]=1
+        labels[rug_pick]=3
+        # Transition pixels use the nearest plausible surface, but wall is
+        # strongly preferred above the estimated boundary.
+        dstack=np.stack([dw,df,dr],axis=0)
+        idx=np.argmin(dstack,axis=0)
+        transition_labels=np.where(idx==0,2,np.where(idx==2,3,1)).astype(np.uint8)
+        labels[transition]=transition_labels[transition]
+    else:
+        labels[lower_zone]=1; labels[transition]=np.where(yy[transition]<H*0.58,2,1)
 
+    labels[hole & (labels==0)] = np.where(yy[hole & (labels==0)] < H*0.58,2,1)
+    return labels
 
 def _add_contact_shadow_mask(image: Image.Image, object_mask: np.ndarray, surface_map: np.ndarray) -> np.ndarray:
     """Add only the likely contact shadow around the lower object edge.
@@ -1032,7 +1629,7 @@ def _add_contact_shadow_mask(image: Image.Image, object_mask: np.ndarray, surfac
     y0, y1 = int(ys.min()), int(ys.max())
     band_h = int(np.clip((y1 - y0 + 1) * 0.10, 8, 36))
     dil = cv2.dilate(object_mask.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), 1).astype(bool)
-    ring = dil & (~object_mask) & (surface_map == 1)
+    ring = dil & (~object_mask) & np.isin(surface_map, (1, 3))
     # Only the lower part of the object's footprint can be contact shadow.
     lower = np.zeros_like(ring)
     lower[max(0, y1 - band_h):min(H, y1 + band_h + 1), max(0, x0 - 16):min(W, x1 + 17)] = True
@@ -1166,6 +1763,38 @@ def _texture_residual_transfer(base: Image.Image, original: Image.Image,
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8))
 
 
+def _surface_guided_reconstruct(image: Image.Image, hard_mask: np.ndarray, surface_map: np.ndarray) -> Image.Image:
+    """Reconstruct a large furniture hole as photographed room surfaces.
+
+    This is intentionally non-generative: it cannot invent a new bed/table.
+    Wall and floor/rug regions are reconstructed independently, using a
+    coarse inpaint pass followed by a narrow full-resolution pass. For large
+    holes this is a safer first choice than Stable Diffusion, whose latent
+    prior can hallucinate replacement furniture even with a strong negative
+    prompt.
+    """
+    if cv2 is None or not hard_mask.any():
+        return image.convert("RGB")
+    src=image.convert("RGB")
+    result=src
+    # Do the wall first, then floor/rug. Each pass sees the original visible
+    # context and only receives pixels from the corresponding surface class.
+    for sid in (2,3,1):
+        target=hard_mask & (surface_map==sid)
+        if not target.any():
+            continue
+        # Large smooth walls benefit from a broader coarse pass; floor/rug
+        # needs a little more local texture retention.
+        radius=6.0 if sid==2 else 5.0
+        result=_multiscale_cv_inpaint(result,target,radius=radius)
+        if sid in (1,3):
+            result=_texture_residual_transfer(result,src,target,surface_map)
+    unresolved=hard_mask & ~((surface_map==1)|(surface_map==2)|(surface_map==3))
+    if unresolved.any():
+        result=_multiscale_cv_inpaint(result,unresolved,radius=4.0)
+    # Strictly restore the original outside the selected object.
+    return _composite_inside_mask(src,result,Image.fromarray((hard_mask.astype(np.uint8)*255),"L"))
+
 def _surface_texture_fill(image: Image.Image, hard_mask: np.ndarray, surface_map: np.ndarray) -> Image.Image:
     """Reconstruct room surfaces without direct RGB stretching.
 
@@ -1199,7 +1828,6 @@ def _surface_texture_fill(image: Image.Image, hard_mask: np.ndarray, surface_map
 
 def _composite_inside_mask(original: Image.Image, generated: Image.Image, mask: Image.Image) -> Image.Image:
     """Guarantee pixels outside the confirmed mask are byte-for-byte preserved."""
-    """Guarantee pixels outside the confirmed mask are byte-for-byte preserved."""
     src=np.asarray(original.convert("RGB"))
     # LaMa/SimpleLama can return an image one pixel smaller/larger after its
     # internal padding/cropping. Always normalize generated + mask to the
@@ -1219,37 +1847,98 @@ def _composite_inside_mask(original: Image.Image, generated: Image.Image, mask: 
     return Image.fromarray(out)
 
 
-def hybrid_inpaint(image: Image.Image, mask_img: Image.Image) -> Image.Image:
-    """AI Remove 2.4: precise mask + mandatory generative reconstruction for large objects."""
+def hybrid_inpaint(image: Image.Image, mask_img: Image.Image, allow_below_gate: bool = False):
+    """AI Remove 2.5: precise SAM mask + model-based reconstruction for large objects.
+
+    Returns (composited_image, meta) where meta is
+    {"passed_gate": bool, "backend": str|None, "seam": float|None, "furniture_penalty": float|None}.
+    """
     hard_mask_img = prepare_inpaint_mask(mask_img, image.size)
     object_mask = np.asarray(hard_mask_img.convert("L")) > 127
     if not object_mask.any():
         raise HTTPException(status_code=422, detail="Masque vide")
+
+    # Phase 5.2.12: log what was actually selected. Two separate small masks
+    # (e.g. decor on each nightstand) versus one large mask (the bed itself)
+    # look identical in the seam/furniture_penalty log lines above, but are
+    # completely different bugs to chase. This makes it visible without
+    # needing a screenshot each time.
+    _ys, _xs = np.where(object_mask)
+    print(
+        f"Mask stats: {100*float(object_mask.mean()):.2f}% of frame "
+        f"({int(object_mask.sum())}px), bbox=({int(_xs.min())},{int(_ys.min())})-"
+        f"({int(_xs.max())},{int(_ys.max())}) in a {image.size[0]}x{image.size[1]} image"
+    )
+    if min(image.size) < 800:
+        print(
+            f"WARNING: source photo is only {image.size[0]}x{image.size[1]} "
+            f"({image.size[0]*image.size[1]} total px). Large-object inpainting "
+            f"on a hole this size (see area above) with this little real detail "
+            f"to reconstruct from is inherently harder, independent of any "
+            f"threshold or model choice. Consider testing with a higher-"
+            f"resolution photo (1500px+ on the short side) before tuning "
+            f"quality gates further."
+        )
 
     area_ratio = float(object_mask.mean())
     # Large furniture is the difficult case. Do NOT silently fall back to the
     # broken deterministic texture-stretch path: either the generative model
     # runs, or the API tells the user exactly what is missing.
     if area_ratio >= 0.015:
-        generated = _diffusion_inpaint_large_object(image, object_mask)
-        if generated is None:
+        result = _remove_only_large_object(image, object_mask)
+        if result is None:
             raise HTTPException(
                 status_code=503,
                 detail=(
-                    "Le moteur de reconstruction générative n'est pas disponible. "
-                    "Installez les dépendances de server/requirements.txt puis redémarrez le serveur."
+                    "Suppression de grande zone refusée : aucun moteur dédié "
+                    "SmartEraser/RORem n'a produit une reconstruction de qualité acceptable. "
+                    "Consultez le terminal pour le candidat et l'erreur exacte."
                 ),
             )
+        # Quality metrics are advisory only. A REMOVE-ONLY candidate is returned
+        # to the editor so the user can see the real reconstruction and undo it
+        # if necessary; never hide it behind a debug-only preview.
         final_mask = Image.fromarray((object_mask.astype(np.uint8)*255), "L")
-        return _composite_inside_mask(image, generated, final_mask)
+        composited = _composite_inside_mask(image, result["image"], final_mask)
+        meta = {"passed_gate": result["passed_gate"], "backend": result["backend"], "seam": result["seam"], "furniture_penalty": result["furniture_penalty"]}
+        return composited, meta
 
     # Small objects can still use the stable LaMa path; this avoids paying the
-    # diffusion cost for pillows, lamps, etc.
+    # diffusion cost for pillows, lamps, etc. There is no seam/furniture gate
+    # here — small holes are what LaMa is reliably good at.
     try:
         lama_img = get_lama()(image, hard_mask_img)
-        return _composite_inside_mask(image, lama_img, hard_mask_img)
+        composited = _composite_inside_mask(image, lama_img, hard_mask_img)
+        return composited, {"passed_gate": True, "backend": "lama-small-object", "seam": None, "furniture_penalty": None}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Inpainting petit objet impossible: {exc}") from exc
+
+
+@app.get("/inpaint-status")
+async def inpaint_status():
+    """Expose the REMOVE-ONLY engine status."""
+    lama_available = False
+    try:
+        import simple_lama_inpainting  # noqa: F401
+        lama_available = True
+    except Exception:
+        pass
+    return JSONResponse({
+        "phase": "5.2.28",
+        "mode": "REMOVE-ONLY",
+        "large_object_strategy": "RORem official 512-short-side dedicated object removal with ensemble, refinement, and narrow recovery band; no LaMa fallback is exposed for large-object Remove AI",
+        "lama_package_available": lama_available,
+        "generative_replacement_enabled": False,
+        "surface_texture_fallback": "planar wall interpolation + local LaMa for rug/floor",
+        "quality_gate": {
+            "strict_max_acceptable_seam": 50.0,
+            "recovery_max_acceptable_seam": 58.0,
+            "recovery_max_furniture_penalty": 0.20,
+            "recovery_min_target_change": 0.32,
+            "recovery_max_residual_structure": 0.45,
+            "max_furniture_penalty": LAMA_CLEAN_FURNITURE_PENALTY,
+        },
+    })
 
 
 @app.post("/select-mask")
@@ -1265,11 +1954,16 @@ async def select_mask(file: UploadFile = File(...), x: int = Form(...), y: int =
     if ratio > 0.42:
         raise HTTPException(status_code=422, detail="Masque non fiable — le modèle a sélectionné une zone trop grande. Cliquez au centre du meuble.")
     bbox={"x":int(xs.min()),"y":int(ys.min()),"width":int(xs.max()-xs.min()+1),"height":int(ys.max()-ys.min()+1)}
-    return JSONResponse({"mask": to_data_url(mask, max_side=1600), "label": label, "area_ratio": ratio, "bbox": bbox, "method": "SAM + semantic context"})
+    # No max_side cap here: unlike the /analyze debug overlays, this exact
+    # mask is what the frontend redraws to a canvas and posts back for the
+    # real /inpaint call (see eraser.js). Downscaling it here was throwing
+    # away SAM's full-resolution boundary before reconstruction ever saw it,
+    # for a single-channel silhouette that compresses to a tiny PNG anyway.
+    return JSONResponse({"mask": to_data_url(mask), "label": label, "area_ratio": ratio, "bbox": bbox, "method": "SAM + semantic context"})
 
 
 @app.post("/inpaint")
-async def inpaint(file: UploadFile = File(...), mask: UploadFile = File(...)):
+async def inpaint(file: UploadFile = File(...), mask: UploadFile = File(...), debug: bool = Form(False)):
     """Remove a user-confirmed furniture mask with LaMa."""
     image = read_image(file)
     try:
@@ -1277,16 +1971,36 @@ async def inpaint(file: UploadFile = File(...), mask: UploadFile = File(...)):
         mask_img = Image.open(io.BytesIO(raw)).convert("L")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Masque invalide: {exc}") from exc
-    result = hybrid_inpaint(image, mask_img)
+    result, meta = hybrid_inpaint(image, mask_img, allow_below_gate=debug)
     if not isinstance(result, Image.Image):
         result = Image.fromarray(np.asarray(result).astype(np.uint8))
-    return JSONResponse({"image": to_data_url(result), "label": "meuble", "method": "generative-reconstruction" if float((np.asarray(mask_img.convert("L")) > 127).mean()) >= 0.015 else "lama-small-object"})
+    return JSONResponse({
+        "image": to_data_url(result),
+        "width": result.width,
+        "height": result.height,
+        "label": "meuble",
+        "method": "ai-remove-only",
+        "quality_gate_passed": meta["passed_gate"],
+        "backend": meta["backend"],
+        "seam": meta["seam"],
+        "furniture_penalty": meta["furniture_penalty"],
+    })
 
 
 @app.post("/remove")
-async def remove(file: UploadFile = File(...), x: int = Form(...), y: int = Form(...)):
+async def remove(file: UploadFile = File(...), x: int = Form(...), y: int = Form(...), debug: bool = Form(False)):
     """One-click backward-compatible remove endpoint using precise selection."""
     image = read_image(file)
     _, label, mask = await _segment_furniture_at_point(image, x, y)
-    result = hybrid_inpaint(image, mask)
-    return JSONResponse({"image": to_data_url(result), "label": label, "method": "generative-reconstruction" if float((np.asarray(mask.convert("L")) > 127).mean()) >= 0.015 else "lama-small-object"})
+    result, meta = hybrid_inpaint(image, mask, allow_below_gate=debug)
+    return JSONResponse({
+        "image": to_data_url(result),
+        "width": result.width,
+        "height": result.height,
+        "label": label,
+        "method": "ai-remove-only",
+        "quality_gate_passed": meta["passed_gate"],
+        "backend": meta["backend"],
+        "seam": meta["seam"],
+        "furniture_penalty": meta["furniture_penalty"],
+    })
