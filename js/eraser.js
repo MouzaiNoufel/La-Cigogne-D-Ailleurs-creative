@@ -107,9 +107,20 @@
     undoBtn.disabled=false;
   }
 
-  function loadRoom(src, statusText) {
+  function loadRoom(src, statusText, expectedWidth=null, expectedHeight=null) {
+    return new Promise((resolve)=>{
     const img=new Image();
     img.onload=()=>{
+      if(expectedWidth && expectedHeight){
+        const sameSize = img.naturalWidth === expectedWidth && img.naturalHeight === expectedHeight;
+        if(!sameSize){
+          setStatus(`Échec : le moteur AI a retourné ${img.naturalWidth}×${img.naturalHeight} au lieu de ${expectedWidth}×${expectedHeight}. La pièce originale est conservée.`);
+          console.error("AI REMOVE dimension mismatch", {returned:[img.naturalWidth,img.naturalHeight], expected:[expectedWidth,expectedHeight]});
+          resolve(false);
+          return;
+        }
+      }
+
       if(state.roomObjectUrl) URL.revokeObjectURL(state.roomObjectUrl);
       state.roomObjectUrl=null;
       state.roomImage=img;
@@ -120,13 +131,44 @@
       selectedMask=null; state.aiMaskImg=null; drawMask(); draw();
       if(window.Phase3?.sync) window.Phase3.sync();
       setStatus(statusText);
+      resolve(true);
     };
-    img.onerror=()=>setStatus("Impossible de restaurer l'image"); img.src=src;
+    img.onerror=()=>{setStatus("Impossible de restaurer l'image");resolve(false);}; img.src=src;
+    });
+  }
+
+  function showDebugPreview(dataUrl, statusText) {
+    // Deliberately independent of state.roomImage/history/draw(). A rejected
+    // result must never become the base the next /inpaint call is built on
+    // (roomBlob() reads state.roomImage directly) — this overlay is purely
+    // visual so the actual working room photo is guaranteed untouched.
+    setStatus(statusText);
+    let overlay=document.getElementById("aiDebugPreviewOverlay");
+    if(!overlay){
+      overlay=document.createElement("div");
+      overlay.id="aiDebugPreviewOverlay";
+      overlay.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;gap:14px;";
+      const img=document.createElement("img");
+      img.id="aiDebugPreviewImg";
+      img.style.cssText="max-width:92vw;max-height:74vh;border:3px dashed #ffb020;border-radius:6px;object-fit:contain;background:#111;";
+      const caption=document.createElement("div");
+      caption.id="aiDebugPreviewCaption";
+      caption.style.cssText="color:#ffb020;font:600 14px/1.4 system-ui,sans-serif;max-width:92vw;text-align:center;";
+      const closeBtn=document.createElement("button");
+      closeBtn.textContent="Fermer l'aperçu (la pièce réelle n'a pas été modifiée)";
+      closeBtn.style.cssText="padding:8px 18px;border-radius:6px;border:none;background:#ffb020;color:#1a1a1a;font-weight:600;cursor:pointer;";
+      closeBtn.onclick=()=>{overlay.style.display="none";};
+      overlay.appendChild(img); overlay.appendChild(caption); overlay.appendChild(closeBtn);
+      document.body.appendChild(overlay);
+    }
+    overlay.querySelector("#aiDebugPreviewImg").src=dataUrl;
+    overlay.querySelector("#aiDebugPreviewCaption").textContent=statusText;
+    overlay.style.display="flex";
   }
 
   function clearSelection() {
     selectedMask=null; selectedLabel=""; state.aiMaskImg=null; drawMask();
-    eraserBtn.textContent="✨ Remplacer IA";
+    eraserBtn.textContent="🧹 Supprimer IA";
     eraserBtn.classList.remove("active");
     state.eraserOn=false;
     const threeStage=document.getElementById("threeStage");
@@ -138,7 +180,6 @@
     if(selectedMask){
       busy=true; eraserBtn.disabled=true; undoBtn.disabled=true;
       try{
-        pushHistory();
         setStatus(`Effacement IA de « ${selectedLabel} » en cours…`);
         const imageBlob=await roomBlob();
         const maskCanvas=document.createElement("canvas"); maskCanvas.width=selectedMask.naturalWidth; maskCanvas.height=selectedMask.naturalHeight;
@@ -148,19 +189,25 @@
         const resp=await fetch(`${API}/inpaint`,{method:"POST",body:fd});
         if(!resp.ok){const e=await resp.json().catch(()=>({}));throw new Error(e.detail||`HTTP ${resp.status}`);}
         const data=await resp.json();
-        loadRoom(data.image,`« ${selectedLabel} » effacé ✔ — ajoutez maintenant votre nouveau meuble`);
+        const seamTxt=typeof data.seam==="number"?data.seam.toFixed(1):"?";
+        const fpTxt=typeof data.furniture_penalty==="number"?data.furniture_penalty.toFixed(3):"?";
+        const expectedW = state.roomImage.naturalWidth;
+        const expectedH = state.roomImage.naturalHeight;
+        const loaded = await loadRoom(data.image,`« ${selectedLabel} » supprimé ✔ — reconstruction ${data.backend||"AI"} · seam ${seamTxt} · furniture ${fpTxt}`, expectedW, expectedH);
+        if(!loaded) throw new Error("Résultat AI rejeté : dimensions incompatibles. La pièce originale est conservée.");
+        pushHistory();
         clearSelection();
       }catch(err){console.error(err);setStatus(`Échec de la suppression IA : ${err.message}`);undoBtn.disabled=history.length===0;}
       finally{busy=false;eraserBtn.disabled=false;}
       return;
     }
     state.eraserOn=!state.eraserOn;
-    eraserBtn.textContent=state.eraserOn?"✨ Sélection IA : cliquez un meuble":"✨ Remplacer IA";
+    eraserBtn.textContent=state.eraserOn?"🧹 Suppression IA : cliquez un meuble":"🧹 Supprimer IA";
     eraserBtn.classList.toggle("active",state.eraserOn);
     canvas.style.cursor=state.eraserOn?"crosshair":"default";
     const threeStage=document.getElementById("threeStage");
     if(threeStage) threeStage.style.pointerEvents=state.eraserOn?"none":"auto";
-    setStatus(state.eraserOn?"Sélection IA — cliquez le meuble réel à remplacer":"Édition IA désactivée");
+    setStatus(state.eraserOn?"Sélection IA — cliquez le meuble réel à supprimer":"Édition IA désactivée");
   });
 
   canvas.addEventListener("click",async e=>{
