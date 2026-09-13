@@ -1,0 +1,30 @@
+LA CIGOGNE D'AILLEURS — PHASE 5.2.15
+
+FULL PROJECT ZIP — NO MANUAL FILE MERGING REQUIRED.
+
+IMPORTANT:
+The first large-object removal may download the PowerPaint v2 model from Hugging Face.
+The model is several GB and is NOT included in this ZIP.
+
+Backend:
+cd "C:\Users\pc\Desktop\La Cigogne D'Ailleurs creative\server"
+uvicorn main:app --reload --port 8000
+
+Frontend (second terminal):
+cd "C:\Users\pc\Desktop\La Cigogne D'Ailleurs creative"
+python -m http.server 5500
+
+Then open:
+http://localhost:5500
+
+TEST:
+Use the same bedroom/bed removal that exposed the 5.2.14 problem.
+
+EXPECTED LOG:
+PowerPaint candidate ...
+Selected PowerPaint directly ...
+If PowerPaint is unavailable or fails its quality check, the system automatically tries LaMa and then Stable Diffusion.
+
+DO NOT manually replace server/main.py.
+
+PHASE 5.2.16: REMOVE-ONLY AI. Do not use a replacement/generative furniture workflow. Click Supprimer IA, click the furniture, confirm removal.
